@@ -1,0 +1,83 @@
+# =============================================================
+#  traffic_marketing — Git 제외 목록
+#
+#  ⚠️ 절대 GitHub 에 올라가면 안 되는 것:
+#     - .env             (텔레그램 봇 토큰, 챗 ID 등 시크릿)
+#     - marketing.db     (순위/발주 기록 — 비공개 데이터)
+#     - auth_session/    (네이버/쿠팡 로그인 쿠키 — 탈취 시 계정 위험)
+# =============================================================
+
+# ── Secrets / 환경변수 ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── 로컬 데이터베이스 ────────────────────────────────────────
+marketing.db
+*.db
+*.sqlite
+*.sqlite3
+# WAL / SHM 사이드카 (SQLite 의 journal_mode=WAL 사용 시 생성됨)
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── 사전 인증 세션 (Playwright 영구 컨텍스트) ────────────────
+auth_session/
+auth_session.zip
+
+# ── 로그 ────────────────────────────────────────────────────
+*.log
+logs/
+nohup.out
+
+# ── Python 캐시 ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ── 가상환경 ────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── 빌드/배포 산출물 ────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── 테스트/커버리지 ─────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache
+
+# ── IDE / 에디터 ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Claude Code 로컬 작업 디렉터리 ──────────────────────────
+.claude/
+
+# ── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Streamlit ───────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Playwright 다운로드 ─────────────────────────────────────
+playwright-report/
+test-results/

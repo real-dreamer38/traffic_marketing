@@ -1,24 +1,28 @@
 # ──────────────────────────────────────────────
 #  traffic_marketing — Python 의존성 목록
-#  설치: pip install -r requirements.txt
-#  Playwright 브라우저: python -m playwright install chromium
+#
+#  설치:
+#    pip install -r requirements.txt
+#    python -m playwright install chromium
+#
+#  버전은 개발 환경에서 검증된 핀(==)으로 고정.
+#  Ubuntu 22.04 / Python 3.10+ 에서 동작 확인.
 # ──────────────────────────────────────────────
 
-# 환경변수 관리
+# ── 환경변수 관리 ─────────────────────────────
 python-dotenv==1.2.2
 
-# 스크래핑
-playwright==1.59.0
-playwright-stealth==2.0.3
-beautifulsoup4==4.14.3
+# ── 스크래핑 (Playwright async API) ───────────
+playwright==1.58.0
 
-# HTTP 클라이언트 (트래픽 API, 슬랙 웹훅)
+# ── HTTP 클라이언트 (텔레그램 봇 API 호출) ────
 requests==2.33.1
 
-# 스케줄러
+# ── 스케줄러 (매일 KST 정시 실행) ─────────────
 APScheduler==3.11.2
+tzlocal==5.3.1
 
-# 대시보드
+# ── 대시보드 ──────────────────────────────────
 streamlit==1.57.0
 pandas==3.0.2
 plotly==6.7.0

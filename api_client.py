@@ -2,11 +2,13 @@
 api_client.py — 트래픽 발주서 생성기.
 
 업계 시행사 대다수는 공개 API 가 없고 카톡/텔레그램으로 오더를 받는다.
-이 모듈은 과거의 가짜 HTTP 호출 로직을 대체하여 다음 세 가지 역할을 한다.
+이 모듈은 사용자가 입력한 발주 정보로 시행사에 전달 가능한 텍스트 발주서를 만들고,
+DB (traffic_logs) 에 우리의 요청 기록을 남기는 두 가지 역할을 한다.
 
-    1) 사용자가 입력한 발주 정보로 시행사에 전달 가능한 깔끔한 텍스트 발주서를 만든다.
-    2) DB (traffic_logs) 에 우리의 요청 기록을 남긴다.
-    3) (옵션) 같은 내용을 Slack Incoming Webhook 으로 푸시한다.
+Note
+----
+MVP 1차에서는 [트래픽 주입] UI 가 비활성화되어 있어 이 모듈은 직접 호출되지 않는다.
+DB 스키마 호환과 향후 재개를 위해 코드만 유지한다.
 
 Public API
 ----------
@@ -19,26 +21,18 @@ Public API
         target_id     = "N_AIRCAP_001",
         quantity      = 500,
         start_date    = date(2026, 5, 15),
-        slack_webhook = "https://hooks.slack.com/services/...",  # 선택
     )
     print(result.order_text)        # 시행사에 보낼 텍스트
-    print(result.slack_pushed)      # 슬랙 푸시 성공 여부
-
-Environment variables
----------------------
-    SLACK_WEBHOOK_URL   기본 슬랙 웹훅 URL (UI 입력이 비어 있을 때 폴백)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
 
-import requests
 from dotenv import load_dotenv
 
 load_dotenv(override=False)
@@ -56,19 +50,15 @@ WEEKDAYS_KR      = ["월", "화", "수", "목", "금", "토", "일"]
 @dataclass
 class OrderResult:
     success:       bool
-    order_text:    str                         = ""
-    requested_at:  Optional[datetime]          = None
-    slack_pushed:  bool                        = False
-    slack_error:   Optional[str]               = None
-    error:         Optional[str]               = None
-    meta:          dict                        = field(default_factory=dict)
+    order_text:    str                = ""
+    requested_at:  Optional[datetime] = None
+    error:         Optional[str]      = None
+    meta:          dict               = field(default_factory=dict)
 
     def to_json(self) -> str:
         payload = {
             "success":      self.success,
             "requested_at": self.requested_at.isoformat() if self.requested_at else None,
-            "slack_pushed": self.slack_pushed,
-            "slack_error":  self.slack_error,
             "error":        self.error,
             "meta":         self.meta,
         }
@@ -94,11 +84,7 @@ def build_order_text(
     start_date:    date,
     requested_at:  Optional[datetime] = None,
 ) -> str:
-    """
-    시행사에 그대로 복사해 보낼 발주서 텍스트를 만든다.
-
-    포맷은 모노스페이스 정렬 박스. 키 항목은 누락 시 '-' 로 표기한다.
-    """
+    """시행사에 그대로 복사해 보낼 발주서 텍스트를 만든다."""
     if requested_at is None:
         requested_at = datetime.now()
 
@@ -140,66 +126,7 @@ def build_order_text(
 
 
 # ---------------------------------------------------------------------------
-# Slack push
-# ---------------------------------------------------------------------------
-
-def push_to_slack(
-    webhook_url: str,
-    order_text:  str,
-    product_name: str,
-    timeout: int = 10,
-) -> tuple[bool, Optional[str]]:
-    """
-    Slack Incoming Webhook 으로 발주서를 전송한다.
-
-    Returns (success, error_message). 네트워크/HTTP 오류는 잡아서 (False, str) 로 반환.
-    """
-    if not webhook_url:
-        return False, "webhook_url is empty"
-
-    # Slack 메시지: 본문은 코드블록(고정폭) 으로 감싸 모노스페이스 박스가 깨지지 않도록 한다
-    fallback = f"[📋 트래픽 발주서] {product_name}"
-    payload = {
-        "text": fallback,
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"📋 트래픽 발주서 — {product_name}", "emoji": True},
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"```\n{order_text}\n```"},
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": "_위 박스 내용을 시행사에 그대로 전달하세요._"},
-                ],
-            },
-        ],
-    }
-
-    try:
-        resp = requests.post(
-            webhook_url,
-            data=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        log.info("Slack 발주서 전송 완료 (status %d)", resp.status_code)
-        return True, None
-    except requests.exceptions.Timeout:
-        return False, "timeout"
-    except requests.exceptions.HTTPError as e:
-        body = (getattr(e.response, "text", "") or "")[:200]
-        return False, f"http_error: {e}  body={body}"
-    except requests.exceptions.RequestException as e:
-        return False, f"request_error: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Top-level orchestrator — 대시보드에서 호출하는 진입점
+# Top-level orchestrator
 # ---------------------------------------------------------------------------
 
 def create_traffic_order(
@@ -212,15 +139,13 @@ def create_traffic_order(
     target_id:     Optional[str],
     quantity:      int,
     start_date:    date,
-    slack_webhook: Optional[str] = None,
     db_path=None,
 ) -> OrderResult:
     """
     발주 1건의 전체 흐름:
       1) 입력 검증
       2) 발주서 텍스트 생성
-      3) traffic_logs 에 기록 (api_status='success' 면 누적 트래픽 집계에 포함)
-      4) Slack 웹훅 푸시 (URL 이 주어졌을 때만)
+      3) traffic_logs 에 기록
     """
     import database as db
 
@@ -252,32 +177,19 @@ def create_traffic_order(
         requested_at = requested_at,
     )
 
-    # Slack 푸시 — 옵션
-    slack_ok    = False
-    slack_error = None
-    webhook = (slack_webhook or os.getenv("SLACK_WEBHOOK_URL", "")).strip()
-    if webhook:
-        slack_ok, slack_error = push_to_slack(webhook, order_text, product_name)
-        if not slack_ok:
-            log.warning("Slack 푸시 실패: %s", slack_error)
-
     meta = {
-        "start_date":   start_date.isoformat(),
-        "target_url":   target_url or "",
-        "target_id":    target_id  or "",
-        "slack_pushed": slack_ok,
+        "start_date": start_date.isoformat(),
+        "target_url": target_url or "",
+        "target_id":  target_id  or "",
     }
 
     result = OrderResult(
         success      = True,
         order_text   = order_text,
         requested_at = requested_at,
-        slack_pushed = slack_ok,
-        slack_error  = slack_error,
         meta         = meta,
     )
 
-    # DB 기록 — 발주서 생성은 항상 성공으로 표기. Slack 푸시 실패 여부는 별도 필드(meta).
     db.init_db(db_path=db_path)
     db.log_traffic(
         product_id    = product_id,
@@ -304,14 +216,13 @@ if __name__ == "__main__":
     )
 
     parser = argparse.ArgumentParser(description="트래픽 발주서 생성기 — 수동 테스트")
-    parser.add_argument("--product",  required=True, help="상품명")
-    parser.add_argument("--platform", required=True, choices=["naver", "coupang"])
-    parser.add_argument("--keyword",  required=True, help="타겟 키워드")
-    parser.add_argument("--url",      default="",     help="상품 URL")
-    parser.add_argument("--target-id",default="",     help="상품 ID")
-    parser.add_argument("--qty",      required=True, type=int, help="목표 수량")
-    parser.add_argument("--start",    default=None,  help="시작일 YYYY-MM-DD (기본: 오늘)")
-    parser.add_argument("--slack",    default=None,  help="Slack Webhook URL (옵션)")
+    parser.add_argument("--product",   required=True, help="상품명")
+    parser.add_argument("--platform",  required=True, choices=["naver", "coupang"])
+    parser.add_argument("--keyword",   required=True, help="타겟 키워드")
+    parser.add_argument("--url",       default="",    help="상품 URL")
+    parser.add_argument("--target-id", default="",    help="상품 ID")
+    parser.add_argument("--qty",       required=True, type=int, help="목표 수량")
+    parser.add_argument("--start",     default=None,  help="시작일 YYYY-MM-DD (기본: 오늘)")
     args = parser.parse_args()
 
     start_date = (
@@ -329,7 +240,3 @@ if __name__ == "__main__":
         start_date   = start_date,
     )
     print(text)
-
-    if args.slack:
-        ok, err = push_to_slack(args.slack, text, args.product)
-        print(f"\nSlack push: {'OK' if ok else 'FAIL'}  {err or ''}")
