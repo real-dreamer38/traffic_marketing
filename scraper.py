@@ -48,8 +48,40 @@ from playwright.async_api import (
     Error as PWError,
     TimeoutError as PWTimeout,
 )
+from playwright_stealth import Stealth
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Anti-bot: 실제 Chrome 처럼 위장
+# ---------------------------------------------------------------------------
+# Why: 쿠팡은 navigator.webdriver, sec-ch-ua 헤더, WebGL fingerprint 등으로 봇을
+# 적극 차단한다. playwright-stealth 가 19개 정도의 흔한 fingerprint 항목을
+# 한번에 패치해 준다. 추가로 우리는 진짜 Chrome UA 와 한국어 Accept-Language
+# 헤더를 명시해서 정합성을 맞춘다.
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+
+_STEALTH = Stealth(
+    navigator_user_agent_override=_CHROME_UA,
+    sec_ch_ua_override=_SEC_CH_UA,
+    navigator_languages_override=("ko-KR", "ko"),
+    navigator_platform_override="Win32",
+)
+
+_EXTRA_HEADERS = {
+    "Accept-Language":  "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Sec-Ch-Ua":        _SEC_CH_UA,
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -159,24 +191,35 @@ async def _launch_persistent_context(
     """
     auth_setup.py 가 만들어 둔 ./auth_session 을 그대로 사용해 영구 컨텍스트를 띄운다.
     수동으로 통과시킨 캡차/로그인 쿠키와 신뢰도를 그대로 상속받는다.
+
+    추가로 playwright-stealth 의 _STEALTH 가 navigator.webdriver / WebGL /
+    sec-ch-ua 등 흔한 봇 지표를 패치한다. 쿠팡의 anti-bot 차단에 대응.
     """
     _ensure_auth_session()
 
     context = await pw.chromium.launch_persistent_context(
         user_data_dir=str(AUTH_SESSION_DIR),
-        channel="chrome",            # 설치된 실제 Google Chrome 사용 (auth_setup 과 동일)
+        channel="chrome",
         headless=headless,
         slow_mo=slow_mo,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-default-browser-check",
             "--no-first-run",
+            "--disable-features=IsolateOrigins,site-per-process",
         ],
         ignore_default_args=["--enable-automation"],
         locale="ko-KR",
         timezone_id="Asia/Seoul",
-        no_viewport=True,
+        user_agent=_CHROME_UA,
+        extra_http_headers=_EXTRA_HEADERS,
+        viewport={"width": 1366, "height": 768},
     )
+
+    # 새 페이지가 만들어질 때마다 자동으로 stealth init script 가 주입되도록 훅 설치
+    await _STEALTH.apply_stealth_async(context)
+    log.info("Stealth + Chrome UA + ko-KR 헤더 적용 완료")
+
     return context
 
 
@@ -206,11 +249,24 @@ async def _navigate_safe(page: Page, url: str, timeout: int = 40_000) -> bool:
 
 
 async def _warm_up(page: Page, home_url: str) -> None:
-    """검색 URL 로 콜드 진입 시 차단되는 케이스 방지를 위해 메인 페이지를 먼저 들름."""
+    """
+    검색 URL 로 콜드 진입 시 차단되는 케이스 방지를 위해 메인 페이지를 먼저 들름.
+
+    쿠팡의 경우 메인에서 마우스를 살짝 움직여 봇 점수를 낮추는 효과도 있다.
+    """
     try:
         log.info("쿠키 워밍 중: %s", home_url)
         await page.goto(home_url, wait_until="load", timeout=30_000)
         await page.wait_for_timeout(random.randint(2_000, 3_500))
+
+        # 마우스 미세 움직임 — 진짜 유저가 페이지를 본 뒤 검색으로 넘어가는 흐름 모사
+        try:
+            for x, y in [(200, 200), (400, 350), (700, 250), (500, 500)]:
+                await page.mouse.move(x, y, steps=10)
+                await page.wait_for_timeout(random.randint(150, 400))
+        except Exception:
+            pass
+
         log.info("쿠키 워밍 완료 — title: %r", await page.title())
     except Exception as e:
         log.debug("워밍 실패(무시): %s", e)

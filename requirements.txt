@@ -12,8 +12,9 @@
 # ── 환경변수 관리 ─────────────────────────────
 python-dotenv==1.2.2
 
-# ── 스크래핑 (Playwright async API) ───────────
+# ── 스크래핑 (Playwright async API + 봇 우회) ─
 playwright==1.58.0
+playwright-stealth==2.0.3
 
 # ── HTTP 클라이언트 (텔레그램 봇 API 호출) ────
 requests==2.33.1
