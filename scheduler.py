@@ -59,8 +59,14 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_URL   = "https://api.telegram.org/bot{token}/sendMessage"
 
 PLATFORM_DISPLAY = {"naver": "네이버", "coupang": "쿠팡"}
-PLATFORM_EMOJI   = {"naver": "🟢", "coupang": "🟡"}
-WEEKDAYS_KR      = ["월", "화", "수", "목", "금", "토", "일"]
+PLATFORM_EMOJI   = {"naver": "🟢", "coupang": "🔴"}
+# 텔레그램 리포트에서 플랫폼별 섹션을 시각적으로 분리하기 위한 헤더.
+PLATFORM_SECTION = {
+    "naver":   "🟢 <b>[ 네이버 쇼핑 순위 ]</b>",
+    "coupang": "🔴 <b>[ 쿠팡 로켓/일반 순위 ]</b>",
+}
+SECTION_DIVIDER = "━━━━━━━━━━━━━━━━━━"
+WEEKDAYS_KR     = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 # ---------------------------------------------------------------------------
@@ -214,23 +220,48 @@ def _fmt_delta(delta: Optional[int], today: int, yesterday: Optional[int]) -> st
     return "➖"
 
 
+def _platform_subtotal(items: list[ReportItem]) -> str:
+    """플랫폼 섹션 하단에 붙는 한 줄 요약."""
+    ok       = [it for it in items if not it.scrape_error]
+    exposed  = sum(1 for it in ok if it.today_rank > 0)
+    improved = sum(1 for it in ok if it.delta and it.delta > 0)
+    worsened = sum(1 for it in ok if it.delta and it.delta < 0)
+    failed   = sum(1 for it in items if it.scrape_error)
+    parts = [
+        f"📈 노출 <b>{exposed}/{len(ok)}</b>",
+        f"🔺 <b>{improved}</b>",
+        f"🔻 <b>{worsened}</b>",
+    ]
+    if failed:
+        parts.append(f"⚠️ 실패 <b>{failed}</b>")
+    return "└ " + " · ".join(parts)
+
+
 def build_telegram_message(items: list[ReportItem]) -> str:
     """
     텔레그램 HTML 파스 모드 메시지를 생성한다.
 
-    구조:
+    네이버/쿠팡 섹션을 시각적으로 분리해 가독성을 높인다.
+
+    구조 예시:
         📊 <b>데일리 순위 모니터링 리포트</b>
         🗓️ 2026-05-20 (수) 08:00
+        ━━━━━━━━━━━━━━━━━━
 
-        🟢 <b>네이버</b>
+        🟢 <b>[ 네이버 쇼핑 순위 ]</b>
           • <b>친환경 에어캡</b> — 8위  🔺 2
           • <b>천연 비누</b>    — 미노출  ⛔
+        └ 📈 노출 1/2 · 🔺 1 · 🔻 0
 
-        🟡 <b>쿠팡</b>
+        ━━━━━━━━━━━━━━━━━━
+
+        🔴 <b>[ 쿠팡 로켓/일반 순위 ]</b>
           • <b>고체 치약</b>   — 5위  ➖
+        └ 📈 노출 1/1 · 🔺 0 · 🔻 0
 
-        ─────────────
-        📈 노출 3/4 · 🔺 상승 1 · 🔻 하락 0
+        ━━━━━━━━━━━━━━━━━━
+        📊 <b>전체 요약</b>
+        📈 노출 2/3 · 🔺 상승 1 · 🔻 하락 0
     """
     now = datetime.now()
     date_str = (
@@ -241,39 +272,54 @@ def build_telegram_message(items: list[ReportItem]) -> str:
     lines: list[str] = [
         "📊 <b>데일리 순위 모니터링 리포트</b>",
         f"🗓️ <i>{html.escape(date_str)}</i>",
+        SECTION_DIVIDER,
         "",
     ]
 
+    rendered_section = False
     for platform in ("naver", "coupang"):
         platform_items = [it for it in items if it.platform == platform]
         if not platform_items:
             continue
 
-        emoji   = PLATFORM_EMOJI[platform]
-        display = PLATFORM_DISPLAY[platform]
-        lines.append(f"{emoji} <b>{display}</b>")
+        if rendered_section:
+            # 이전 플랫폼 섹션과 시각적으로 끊는다
+            lines.append(SECTION_DIVIDER)
+            lines.append("")
+
+        lines.append(PLATFORM_SECTION[platform])
 
         for it in platform_items:
             name_esc = html.escape(it.name)
             if it.scrape_error:
                 err_esc = html.escape(it.scrape_error[:60])
-                lines.append(f"  • <b>{name_esc}</b> — ⚠️ 조회실패  <code>{err_esc}</code>")
+                lines.append(
+                    f"  • <b>{name_esc}</b> — ⚠️ 조회실패  <code>{err_esc}</code>"
+                )
                 continue
 
             rank_str  = _fmt_rank(it.today_rank)
             delta_str = _fmt_delta(it.delta, it.today_rank, it.yesterday_rank)
             lines.append(f"  • <b>{name_esc}</b> — <b>{rank_str}</b>  {delta_str}")
 
+        # 플랫폼별 미니 요약
+        lines.append(_platform_subtotal(platform_items))
         lines.append("")
+        rendered_section = True
 
+    # 전체 요약 푸터
     scrape_ok = [it for it in items if not it.scrape_error]
     failed    = sum(1 for it in items if it.scrape_error)
     exposed   = sum(1 for it in scrape_ok if it.today_rank > 0)
     improved  = sum(1 for it in scrape_ok if it.delta and it.delta > 0)
     worsened  = sum(1 for it in scrape_ok if it.delta and it.delta < 0)
 
-    lines.append("─────────────")
-    footer = f"📈 노출 <b>{exposed}/{len(scrape_ok)}</b> · 🔺 상승 <b>{improved}</b> · 🔻 하락 <b>{worsened}</b>"
+    lines.append(SECTION_DIVIDER)
+    lines.append("📊 <b>전체 요약</b>")
+    footer = (
+        f"📈 노출 <b>{exposed}/{len(scrape_ok)}</b> · "
+        f"🔺 상승 <b>{improved}</b> · 🔻 하락 <b>{worsened}</b>"
+    )
     if failed:
         footer += f" · ⚠️ 조회실패 <b>{failed}</b>"
     lines.append(footer)

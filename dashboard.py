@@ -47,6 +47,35 @@ db.init_db()
 
 PLATFORM_KR = {"naver": "네이버", "coupang": "쿠팡"}
 
+# 플랫폼별 등록 폼 안내문 — 탭마다 다른 placeholder/label/help 를 적용해
+# 사용자가 어떤 플랫폼 정보를 넣어야 하는지 즉시 알 수 있게 한다.
+PLATFORM_FORM_HINTS = {
+    "naver": {
+        "tab_label":           "🟢 네이버 상품 관리",
+        "section_emoji":       "🟢",
+        "name_placeholder":    "예) 친환경 에어캡",
+        "keyword_placeholder": "예) 친환경 에어캡",
+        "id_label":            "네이버 상품 ID (catalog ID / nvMid)",
+        "id_placeholder":      "예) 40155252748",
+        "id_help":             "catalog/40155252748, nvMid, productId 중 하나. URL 만 넣으면 자동 추출됩니다.",
+        "url_label":           "스마트스토어 / 네이버쇼핑 URL",
+        "url_placeholder":     "https://smartstore.naver.com/.../products/12345",
+        "url_help":            "스마트스토어 상품 URL 또는 search.shopping.naver.com/catalog/... URL 을 붙여 넣으세요.",
+    },
+    "coupang": {
+        "tab_label":           "🔴 쿠팡 상품 관리",
+        "section_emoji":       "🔴",
+        "name_placeholder":    "예) 고체 치약",
+        "keyword_placeholder": "예) 고체 치약",
+        "id_label":            "쿠팡 상품 ID (productId / vendorItemId)",
+        "id_placeholder":      "예) 1234567890",
+        "id_help":             "/vp/products/<id> 의 productId 또는 vendorItemId. URL 만 넣으면 자동 추출됩니다.",
+        "url_label":           "쿠팡 상품 URL",
+        "url_placeholder":     "https://www.coupang.com/vp/products/1234567890?...",
+        "url_help":             "쿠팡 상품 상세 URL 을 그대로 붙여 넣으세요. productId/vendorItemId 가 자동 추출됩니다.",
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Global CSS — single <style> block (no leaked text, @import inside)
 # ---------------------------------------------------------------------------
@@ -507,8 +536,16 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60)
-def load_products() -> list[dict]:
-    rows = db.list_products(active_only=True)
+def load_products(platform: Optional[str] = None) -> list[dict]:
+    """platform 지정 시 해당 플랫폼만, None 이면 전체 활성 상품."""
+    rows = db.list_products(active_only=True, platform=platform)
+    return [dict(r) for r in rows]
+
+
+@st.cache_data(ttl=30)
+def load_all_products(platform: Optional[str] = None) -> list[dict]:
+    """비활성 포함 — 상품 관리 표에서 사용."""
+    rows = db.list_products(active_only=False, platform=platform)
     return [dict(r) for r in rows]
 
 
@@ -728,9 +765,12 @@ def render_product_grid(products: list[dict]) -> None:
 # Tab 1 — 순위 현황
 # ---------------------------------------------------------------------------
 
-def render_rank_tab(products: list[dict]) -> None:
+def render_rank_section(platform: str, products: list[dict]) -> None:
+    """플랫폼별 순위 현황 카드 묶음. products 는 이미 해당 플랫폼으로 필터된 리스트."""
+    platform_kr = PLATFORM_KR.get(platform, platform)
+
     if not products:
-        st.info("등록된 상품이 없습니다. [상품 관리] 탭에서 추가해 주세요.")
+        st.info(f"등록된 {platform_kr} 상품이 없습니다. 아래 [상품 등록] 카드에서 추가해 주세요.")
         return
 
     total = len(products)
@@ -748,27 +788,33 @@ def render_rank_tab(products: list[dict]) -> None:
 
     # ── Card 1: KPI ──
     with st.container(border=True):
-        st.markdown('<div class="section-title">전체 요약</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">{platform_kr} 요약</div>',
+            unsafe_allow_html=True,
+        )
         render_kpi_grid(total, exposed, improved, worsened)
 
     # ── Card 2: 상품별 현재 순위 ──
     with st.container(border=True):
-        st.markdown('<div class="section-title">상품별 현재 순위</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">{platform_kr} 상품별 현재 순위</div>',
+            unsafe_allow_html=True,
+        )
         render_product_grid(products)
 
     # ── Card 3: 트렌드 차트 ──
     with st.container(border=True):
-        st.markdown('<div class="section-title">순위 트렌드</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">{platform_kr} 순위 트렌드</div>',
+            unsafe_allow_html=True,
+        )
 
-        product_names = [
-            f"{p['name']} · {PLATFORM_KR.get(p['platform'], p['platform'])}"
-            for p in products
-        ]
+        product_names = [p["name"] for p in products]
         selected_label = st.selectbox(
             "상품 선택",
             options=product_names,
             label_visibility="collapsed",
-            key="rank_product_select",
+            key=f"rank_product_select_{platform}",
         )
         selected_idx  = product_names.index(selected_label)
         selected_prod = products[selected_idx]
@@ -776,11 +822,14 @@ def render_rank_tab(products: list[dict]) -> None:
         df             = load_rank_history(selected_prod["id"], trend_days)
         competitors_df = load_competitor_history(selected_prod["id"], trend_days)
         fig            = build_trend_chart(selected_prod["name"], df, competitors_df)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"rank_chart_{platform}")
 
     # ── Card 4: 원본 데이터 ──
     with st.container(border=True):
-        st.markdown('<div class="section-title">원본 데이터</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">{platform_kr} 원본 데이터</div>',
+            unsafe_allow_html=True,
+        )
 
         col_a, col_b = st.columns(2)
 
@@ -823,27 +872,6 @@ def render_rank_tab(products: list[dict]) -> None:
 # Tab 2 — 상품 관리
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=30)
-def load_management_overview() -> pd.DataFrame:
-    rows = db.list_products(active_only=False)
-    records: list[dict] = []
-    for r in rows:
-        p = dict(r)
-        latest = db.get_latest_rank(p["id"])
-        rank_str = "미노출" if (not latest or latest["rank"] == 0) else f"{latest['rank']}위"
-        created = (p["created_at"] or "")[:10]
-        records.append({
-            "ID":         p["id"],
-            "상품명":      p["name"],
-            "키워드":      p["keyword"],
-            "플랫폼":      PLATFORM_KR.get(p["platform"], p["platform"]),
-            "현재 순위":   rank_str,
-            "등록일":      created,
-            "상태":        "활성" if p["active"] else "중지",
-        })
-    return pd.DataFrame(records)
-
-
 @st.dialog("⚠️ 상품 삭제 확인")
 def _confirm_delete_dialog() -> None:
     pending = st.session_state.get("pending_delete")
@@ -851,13 +879,15 @@ def _confirm_delete_dialog() -> None:
         return
 
     name_esc = _html.escape(pending["name"])
+    platform_kr = PLATFORM_KR.get(pending.get("platform", ""), "")
+    platform_tag = f"<span class='pill pill-slate'>{platform_kr}</span> " if platform_kr else ""
 
     st.markdown(
         "<div class='delete-dialog-msg'>해당 상품을 영구 삭제하시겠습니까?</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
-        f"<div class='delete-dialog-name'>🗑️ {name_esc}</div>",
+        f"<div class='delete-dialog-name'>🗑️ {platform_tag}{name_esc}</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -883,108 +913,123 @@ def _confirm_delete_dialog() -> None:
         st.rerun()
 
 
-def render_manage_tab() -> None:
-    all_products_full = [dict(p) for p in db.list_products(active_only=False)]
+def render_manage_section(platform: str) -> None:
+    """
+    한 플랫폼에 대한 상품 등록/수정 폼 + 상품 리스트(토글/삭제) 카드.
+
+    platform : 'naver' 또는 'coupang' — 폼의 플랫폼 필드는 이 값으로 고정된다.
+    """
+    hints       = PLATFORM_FORM_HINTS[platform]
+    platform_kr = PLATFORM_KR[platform]
+    products_in_platform = [
+        dict(p) for p in db.list_products(active_only=False, platform=platform)
+    ]
 
     left, right = st.columns([1, 1.7], gap="large")
 
-    # ── 좌측 카드: 등록 / 수정 폼 ─────────────────────────────
+    # ── 좌측 카드: 등록 / 수정 폼 (platform 고정) ─────────────
     with left:
         with st.container(border=True):
-            st.markdown('<div class="section-title">상품 등록 / 수정</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="section-title">{hints["section_emoji"]} {platform_kr} 상품 등록 / 수정</div>',
+                unsafe_allow_html=True,
+            )
 
             mode = st.radio(
                 "작업 모드",
                 ["추가", "수정"],
                 horizontal=True,
-                key="manage_mode_radio",
+                key=f"manage_mode_radio_{platform}",
                 label_visibility="collapsed",
             )
 
             edit_target: Optional[dict] = None
             if mode == "수정":
-                if not all_products_full:
-                    st.info("등록된 상품이 없습니다. 먼저 추가해 주세요.")
+                if not products_in_platform:
+                    st.info(f"등록된 {platform_kr} 상품이 없습니다. 먼저 추가해 주세요.")
                 else:
-                    edit_labels = [f"[{p['id']}] {p['name']}" for p in all_products_full]
+                    edit_labels = [f"[{p['id']}] {p['name']}" for p in products_in_platform]
                     pick = st.selectbox(
                         "수정할 상품",
                         edit_labels,
-                        key="manage_edit_target_select",
+                        key=f"manage_edit_target_select_{platform}",
                     )
-                    edit_target = all_products_full[edit_labels.index(pick)]
+                    edit_target = products_in_platform[edit_labels.index(pick)]
 
-            key_suffix = f"edit_{edit_target['id']}" if edit_target else "add"
-            defaults   = edit_target or {}
+            key_suffix = (
+                f"edit_{edit_target['id']}" if edit_target else "add"
+            )
+            defaults = edit_target or {}
+
+            # 플랫폼 배지 — 폼이 어느 플랫폼에 속하는지 시각적으로 확정
+            st.markdown(
+                f"<div style='margin-bottom:10px;'>"
+                f"<span class='pill pill-blue'>플랫폼 · {platform_kr}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
             name = st.text_input(
                 "상품명",
                 value=str(defaults.get("name") or ""),
-                placeholder="친환경 에어캡",
-                key=f"manage_name_input_{key_suffix}",
-            )
-
-            platform_opts = ["naver", "coupang"]
-            platform_idx  = (
-                platform_opts.index(defaults["platform"])
-                if defaults.get("platform") in platform_opts else 0
-            )
-            platform = st.selectbox(
-                "플랫폼",
-                platform_opts,
-                index=platform_idx,
-                format_func=lambda x: PLATFORM_KR[x],
-                key=f"manage_platform_select_{key_suffix}",
+                placeholder=hints["name_placeholder"],
+                key=f"manage_name_input_{platform}_{key_suffix}",
             )
 
             keyword = st.text_input(
                 "타겟 키워드",
                 value=str(defaults.get("keyword") or ""),
-                placeholder="친환경 에어캡",
-                key=f"manage_keyword_input_{key_suffix}",
-            )
-
-            target_id = st.text_input(
-                "상품 ID",
-                value=str(defaults.get("target_id") or ""),
-                placeholder="40155252748",
-                key=f"manage_target_id_input_{key_suffix}",
+                placeholder=hints["keyword_placeholder"],
+                key=f"manage_keyword_input_{platform}_{key_suffix}",
             )
 
             target_url = st.text_input(
-                "상품 URL",
+                hints["url_label"],
                 value=str(defaults.get("target_url") or ""),
-                placeholder="https://smartstore.naver.com/...",
-                key=f"manage_target_url_input_{key_suffix}",
+                placeholder=hints["url_placeholder"],
+                help=hints["url_help"],
+                key=f"manage_target_url_input_{platform}_{key_suffix}",
+            )
+
+            target_id = st.text_input(
+                hints["id_label"],
+                value=str(defaults.get("target_id") or ""),
+                placeholder=hints["id_placeholder"],
+                help=hints["id_help"],
+                key=f"manage_target_id_input_{platform}_{key_suffix}",
             )
 
             if mode == "수정" and edit_target is not None:
                 submit_label = "수정 저장"
-                submit_key   = f"manage_save_btn_{edit_target['id']}"
+                submit_key   = f"manage_save_btn_{platform}_{edit_target['id']}"
             else:
-                submit_label = "상품 추가"
-                submit_key   = "manage_add_btn"
+                submit_label = f"{platform_kr} 상품 추가"
+                submit_key   = f"manage_add_btn_{platform}"
 
             if st.button(submit_label, type="primary",
                          use_container_width=True, key=submit_key):
+                # URL 만 입력하고 ID 가 비어있으면 플랫폼별 패턴으로 자동 추출
+                raw_url = target_url.strip()
+                raw_id  = target_id.strip()
+                effective_id = raw_id or (db.extract_product_id(platform, raw_url) or "")
+
                 if not name.strip() or not keyword.strip():
                     st.error("상품명과 키워드는 필수입니다.")
+                elif not effective_id and not raw_url:
+                    st.error("상품 ID 또는 URL 중 하나는 입력해야 합니다.")
                 elif edit_target is not None:
                     db.update_product(
                         product_id=edit_target["id"],
                         name=name.strip(),
                         keyword=keyword.strip(),
-                        target_id=target_id.strip() or None,
-                        target_url=target_url.strip() or None,
+                        target_id=effective_id or None,
+                        target_url=raw_url or None,
                     )
-                    if platform != edit_target.get("platform"):
-                        with db.get_conn() as conn:
-                            conn.execute(
-                                "UPDATE products SET platform = ? WHERE id = ?",
-                                (platform, edit_target["id"]),
-                            )
-                    st.success(f"수정 완료 (ID: {edit_target['id']})")
+                    auto_note = (
+                        f" · URL 에서 ID 자동 추출: {effective_id}"
+                        if not raw_id and effective_id else ""
+                    )
+                    st.success(f"수정 완료 (ID: {edit_target['id']}){auto_note}")
                     st.cache_data.clear()
                     st.rerun()
                 else:
@@ -992,25 +1037,32 @@ def render_manage_tab() -> None:
                         name=name.strip(),
                         platform=platform,
                         keyword=keyword.strip(),
-                        target_id=target_id.strip() or None,
-                        target_url=target_url.strip() or None,
+                        target_id=effective_id or None,
+                        target_url=raw_url or None,
                     )
-                    st.success(f"상품 추가 완료 (ID: {new_id})")
+                    auto_note = (
+                        f" · URL 에서 ID 자동 추출: {effective_id}"
+                        if not raw_id and effective_id else ""
+                    )
+                    st.success(f"{platform_kr} 상품 추가 완료 (ID: {new_id}){auto_note}")
                     st.cache_data.clear()
                     st.rerun()
 
-    # ── 우측 카드: 상품 목록 (per-row 토글 / 삭제) ─────────
+    # ── 우측 카드: 상품 목록 (플랫폼별 독립 토글/삭제) ─────────
     with right:
         with st.container(border=True):
-            st.markdown('<div class="section-title">등록 상품 목록</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="section-title">{platform_kr} 등록 상품 목록</div>',
+                unsafe_allow_html=True,
+            )
 
-            if not all_products_full:
-                st.caption("등록된 상품이 없습니다. 좌측에서 추가해 주세요.")
+            if not products_in_platform:
+                st.caption(f"등록된 {platform_kr} 상품이 없습니다. 좌측에서 추가해 주세요.")
             else:
-                # 컬럼 비율: ID · 상품명 · 키워드 · 플랫폼 · 현재 순위 · 토글 · 삭제
-                col_ratios = [0.45, 2.1, 1.6, 0.9, 1.0, 1.0, 0.7]
-                header_labels = ["ID", "상품명", "키워드", "플랫폼",
+                # 컬럼 비율: ID · 상품명 · 키워드 · 현재 순위 · 토글 · 삭제
+                # (플랫폼 컬럼은 탭 자체가 플랫폼을 나타내므로 제거)
+                col_ratios   = [0.5, 2.4, 1.8, 1.1, 1.0, 0.8]
+                header_labels = ["ID", "상품명", "키워드",
                                  "현재 순위", "상태", ""]
 
                 hdr_cols = st.columns(col_ratios)
@@ -1025,12 +1077,11 @@ def render_manage_tab() -> None:
                     unsafe_allow_html=True,
                 )
 
-                for product in all_products_full:
+                for product in products_in_platform:
                     latest    = db.get_latest_rank(product["id"])
                     rank_now  = latest["rank"] if latest else 0
                     rank_str  = "미노출" if rank_now == 0 else f"{rank_now}위"
                     is_active = bool(product["active"])
-                    platform_kr = PLATFORM_KR.get(product["platform"], product["platform"])
                     name_esc    = _html.escape(product["name"])
                     keyword_esc = _html.escape(product["keyword"])
 
@@ -1047,22 +1098,18 @@ def render_manage_tab() -> None:
                         f"<div class='tr-cell muted'>{keyword_esc}</div>",
                         unsafe_allow_html=True,
                     )
-                    row[3].markdown(
-                        f"<div class='tr-cell'>{platform_kr}</div>",
-                        unsafe_allow_html=True,
-                    )
 
                     rank_pill_class = "pill pill-slate" if rank_now == 0 else "pill pill-blue"
-                    row[4].markdown(
+                    row[3].markdown(
                         f"<div class='tr-cell'><span class='{rank_pill_class}'>{rank_str}</span></div>",
                         unsafe_allow_html=True,
                     )
 
                     toggle_label = "비활성" if is_active else "활성"
                     toggle_help  = "지금 비활성화" if is_active else "지금 활성화"
-                    if row[5].button(
+                    if row[4].button(
                         toggle_label,
-                        key=f"toggle_btn_{product['id']}",
+                        key=f"toggle_btn_{platform}_{product['id']}",
                         use_container_width=True,
                         help=toggle_help,
                         type="primary" if is_active else "secondary",
@@ -1071,35 +1118,45 @@ def render_manage_tab() -> None:
                         st.cache_data.clear()
                         st.rerun()
 
-                    if row[6].button(
+                    if row[5].button(
                         "삭제",
-                        key=f"delete_btn_{product['id']}",
+                        key=f"delete_btn_{platform}_{product['id']}",
                         use_container_width=True,
                         help=f"상품 '{product['name']}' 삭제",
                     ):
                         st.session_state["pending_delete"] = {
-                            "id":   product["id"],
-                            "name": product["name"],
+                            "id":       product["id"],
+                            "name":     product["name"],
+                            "platform": product["platform"],
                         }
                         st.rerun()
 
-                st.caption(f"총 {len(all_products_full)}개 상품")
+                st.caption(f"총 {len(products_in_platform)}개 {platform_kr} 상품")
 
-            # 삭제 확정 다이얼로그 — session_state 에 pending 이 있으면 표시
-            if st.session_state.get("pending_delete"):
-                _confirm_delete_dialog()
+
+def render_platform_tab(platform: str) -> None:
+    """플랫폼 탭 한 개를 구성한다 — 순위 현황 + 상품 등록/관리 카드 묶음."""
+    products = load_products(platform=platform)
+    render_rank_section(platform, products)
+    render_manage_section(platform)
 
 
 # ---------------------------------------------------------------------------
-# Main — 2 tabs (MVP 1차)
+# Main — 플랫폼별 탭 (네이버 / 쿠팡 완전 분리)
 # ---------------------------------------------------------------------------
 
-products = load_products()
+tab_naver, tab_coupang = st.tabs([
+    PLATFORM_FORM_HINTS["naver"]["tab_label"],
+    PLATFORM_FORM_HINTS["coupang"]["tab_label"],
+])
 
-tab_rank, tab_manage = st.tabs(["순위 현황", "상품 관리"])
+with tab_naver:
+    render_platform_tab("naver")
 
-with tab_rank:
-    render_rank_tab(products)
+with tab_coupang:
+    render_platform_tab("coupang")
 
-with tab_manage:
-    render_manage_tab()
+# 플랫폼 탭 어디서든 삭제 버튼이 눌리면 session_state 에 pending_delete 가 들어가고
+# 다이얼로그가 한 번만 열리도록 최상단에서 처리한다.
+if st.session_state.get("pending_delete"):
+    _confirm_delete_dialog()

@@ -7,6 +7,7 @@ Tables:
   traffic_logs  — external traffic API call records per product
 """
 
+import re
 import sqlite3
 import logging
 from contextlib import contextmanager
@@ -118,6 +119,45 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
 
 # ---------------------------------------------------------------------------
+# URL → product ID 추출 헬퍼
+# ---------------------------------------------------------------------------
+# 대시보드 등록 폼에서 사용자가 상품 URL 만 붙여 넣어도 target_id 가 자동
+# 채워지도록 도와준다. 스크래퍼의 매칭 로직(_NAVER_ID_PATTERNS / _COUPANG_ID_PATTERNS)
+# 과 동일한 규약을 그대로 따른다.
+
+_NAVER_URL_PATTERNS = [
+    re.compile(r"/catalog/(\d{8,})"),
+    re.compile(r"[?&]nvMid=(\d+)"),
+    re.compile(r"[?&]productId=(\d+)"),
+    re.compile(r"/products/(\d{6,})"),     # smartstore /products/12345
+    re.compile(r"itemId=(\d+)"),
+]
+
+_COUPANG_URL_PATTERNS = [
+    re.compile(r"/vp/products/(\d+)"),
+    re.compile(r"[?&]vendorItemId=(\d+)"),
+    re.compile(r"[?&]itemId=(\d+)"),
+    re.compile(r"[?&]productId=(\d+)"),
+]
+
+
+def extract_product_id(platform: str, url: str) -> Optional[str]:
+    """
+    URL 에서 플랫폼별 상품 ID(MID / vendorItemId / productId 등)를 추출한다.
+    매칭 실패 시 None.
+    """
+    if not url:
+        return None
+    platform = (platform or "").lower()
+    patterns = _NAVER_URL_PATTERNS if platform == "naver" else _COUPANG_URL_PATTERNS
+    for pat in patterns:
+        m = pat.search(url)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # products CRUD
 # ---------------------------------------------------------------------------
 
@@ -152,13 +192,40 @@ def get_product(product_id: int, db_path: Path = DB_PATH) -> Optional[sqlite3.Ro
     return row
 
 
-def list_products(active_only: bool = True, db_path: Path = DB_PATH) -> list[sqlite3.Row]:
+def list_products(
+    active_only: bool = True,
+    platform: Optional[str] = None,
+    db_path: Path = DB_PATH,
+) -> list[sqlite3.Row]:
+    """
+    Return registered products.
+
+    Parameters
+    ----------
+    active_only : bool
+        True 면 active=1 인 행만 반환.
+    platform : Optional[str]
+        'naver' 또는 'coupang' 지정 시 해당 플랫폼만 필터링.
+        None 이면 모든 플랫폼.
+    """
     sql = "SELECT * FROM products"
+    conditions: list[str] = []
+    params: list[object] = []
     if active_only:
-        sql += " WHERE active = 1"
+        conditions.append("active = 1")
+    if platform is not None:
+        platform = platform.lower()
+        if platform not in ("naver", "coupang"):
+            raise ValueError(
+                f"platform must be 'naver' or 'coupang', got: {platform!r}"
+            )
+        conditions.append("platform = ?")
+        params.append(platform)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY platform, name"
     with get_conn(db_path) as conn:
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return rows
 
 
