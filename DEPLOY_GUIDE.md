@@ -1,7 +1,11 @@
 # 🚀 traffic_marketing — Ubuntu 서버 배포 가이드
 
 데스크탑 → AWS EC2 / 오라클 클라우드 (Ubuntu 22.04 LTS) 이전용 가이드.
-처음부터 끝까지 순서대로 따라가면 매일 KST 08:00 에 텔레그램으로 순위 리포트가 자동 발송됩니다.
+처음부터 끝까지 순서대로 따라가면 매일 **KST 09:00** 에 텔레그램으로 순위 리포트가 자동 발송됩니다.
+
+> 🕘 **시간대 안내** — `scheduler.py` 는 APScheduler 의 `timezone="Asia/Seoul"`
+> 옵션을 사용해 서버의 OS 타임존(오라클/AWS Ubuntu 는 보통 UTC)과 무관하게
+> 한국 시간 기준 정시에 동작합니다. 서버 타임존을 굳이 KST 로 바꿀 필요는 없습니다.
 
 > **전제**: Ubuntu 22.04 LTS, 1 vCPU / 1GB RAM 이상, 22번 포트 SSH 접근 가능.
 
@@ -107,7 +111,7 @@ nano .env
 ```env
 TELEGRAM_BOT_TOKEN=8823068824:AAGGEZlkjq_FIy7C8E1nULLJqBU-dQ0M5o8
 TELEGRAM_CHAT_ID=6554024624
-REPORT_HOUR=8
+REPORT_HOUR=9
 REPORT_MINUTE=0
 ```
 
@@ -181,9 +185,16 @@ python scheduler.py --now
 
 ---
 
-## 8. 24시간 백그라운드 실행 — 3가지 방식 중 택1
+## 8. 매일 09:00 KST 자동 실행 — 4가지 방식 중 택1
 
-### 🥇 방식 A — tmux (가장 간단, 추천)
+> ✅ **권장: 방식 C (systemd service)** — 서버 재부팅 후에도 자동 복구되고
+> 로그/상태 관리가 가장 깔끔합니다. 단순 1회성 테스트는 방식 A(tmux) 로 충분.
+>
+> 모든 방식의 공통 동작: `scheduler.py --schedule` 가 백그라운드에서 상주하며
+> APScheduler 의 `CronTrigger(hour=9, timezone="Asia/Seoul")` 가 매일 한국 시간
+> 09:00 정각에 1회씩 발화합니다. (`.env` 의 `REPORT_HOUR=9` 가 기본값)
+
+### 🥇 방식 A — tmux (가장 간단, 1회 테스트용)
 
 ```bash
 # 세션 시작
@@ -193,6 +204,9 @@ tmux new -s rank-bot
 cd ~/traffic_marketing
 source venv/bin/activate
 python scheduler.py --schedule
+
+# 콘솔에 다음 로그가 보이면 성공:
+#   스케줄러 실행 중 (매일 09:00 KST)  |  Ctrl-C 로 종료
 
 # 세션 detach (스케줄러는 계속 동작): Ctrl-B 누르고 D
 # SSH 끊고 다시 들어와서 다시 보려면:
@@ -224,25 +238,31 @@ tail -f scheduler.log
 ps aux | grep scheduler.py | grep -v grep | awk '{print $2}' | xargs kill
 ```
 
-### 🥉 방식 C — systemd (서버 재부팅에도 자동 부활, 운영용)
+### 🥉 방식 C — systemd service (운영 추천, 재부팅에도 자동 부활)
+
+`scheduler.py --schedule` 프로세스를 systemd 가 상시 데몬으로 관리하며,
+내부의 APScheduler 가 KST 09:00 에 발화한다. 재부팅·크래시 자동 복구.
 
 ```bash
 sudo nano /etc/systemd/system/rank-bot.service
 ```
 
-다음 내용 붙여넣기 (`ubuntu` 부분은 본인 계정명으로):
+다음 내용 그대로 붙여넣기 (`ubuntu` 부분은 본인 계정명으로 치환):
 
 ```ini
 [Unit]
-Description=Traffic Marketing — Daily Rank Report Bot
-After=network.target
+Description=Traffic Marketing — Daily Rank Report Bot (KST 09:00)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/traffic_marketing
 EnvironmentFile=/home/ubuntu/traffic_marketing/.env
-ExecStart=/home/ubuntu/traffic_marketing/venv/bin/python scheduler.py --schedule
+# scheduler.py 는 내부적으로 timezone="Asia/Seoul" 의 APScheduler 를 사용해
+# 서버 OS 가 UTC 여도 매일 KST 09:00 에 정확히 발화한다.
+ExecStart=/home/ubuntu/traffic_marketing/venv/bin/python -u scheduler.py --schedule --hour 9 --minute 0
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/ubuntu/traffic_marketing/scheduler.log
@@ -256,9 +276,72 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable rank-bot     # 부팅 시 자동 시작
 sudo systemctl start rank-bot
-sudo systemctl status rank-bot     # 동작 상태 확인
+sudo systemctl status rank-bot     # 동작 상태 확인 (active (running) 보이면 OK)
 journalctl -u rank-bot -f          # 실시간 로그
 ```
+
+운영 명령:
+
+```bash
+sudo systemctl restart rank-bot    # 코드 업데이트 후 재시작
+sudo systemctl stop rank-bot       # 일시 정지
+sudo systemctl disable rank-bot    # 부팅 자동시작 해제
+```
+
+### 🏅 방식 D — crontab (외부 cron 으로 매일 09:00 KST 직접 트리거)
+
+상주 데몬 대신 cron 이 매일 정확히 한 번 `scheduler.py --now` 를 실행하는 방식.
+가장 가볍지만, 서버 타임존이 UTC 면 cron 에는 **00:00 UTC = 09:00 KST** 로
+적어야 한다.
+
+```bash
+# 1) 서버 타임존 확인
+timedatectl | grep "Time zone"
+#   Time zone: Etc/UTC (UTC, +0000)   ← UTC 인 경우
+#   Time zone: Asia/Seoul (KST, +0900) ← 이미 KST 인 경우
+
+# 2) crontab 편집
+crontab -e
+```
+
+서버가 **UTC** 인 경우 (오라클/AWS Ubuntu 기본):
+
+```cron
+# 매일 KST 09:00 = UTC 00:00 에 일회성 실행
+0 0 * * * cd /home/ubuntu/traffic_marketing && /home/ubuntu/traffic_marketing/venv/bin/python scheduler.py --now >> /home/ubuntu/traffic_marketing/scheduler.log 2>&1
+```
+
+서버가 **KST (Asia/Seoul)** 인 경우:
+
+```cron
+# 매일 KST 09:00 에 일회성 실행
+0 9 * * * cd /home/ubuntu/traffic_marketing && /home/ubuntu/traffic_marketing/venv/bin/python scheduler.py --now >> /home/ubuntu/traffic_marketing/scheduler.log 2>&1
+```
+
+또는 cron 이 타임존을 직접 인식하게 하려면 (Ubuntu cron 은 `CRON_TZ` 지원):
+
+```cron
+CRON_TZ=Asia/Seoul
+0 9 * * * cd /home/ubuntu/traffic_marketing && /home/ubuntu/traffic_marketing/venv/bin/python scheduler.py --now >> /home/ubuntu/traffic_marketing/scheduler.log 2>&1
+```
+
+크론 동작 확인:
+
+```bash
+# 등록된 크론잡 보기
+crontab -l
+
+# cron 자체가 살아있는지
+systemctl status cron
+
+# 실행 로그
+tail -f /home/ubuntu/traffic_marketing/scheduler.log
+grep CRON /var/log/syslog | tail
+```
+
+> 💡 cron 방식은 `scheduler.py --now` 가 끝나면 프로세스도 종료되므로 메모리
+> 점유가 0 이지만, APScheduler 의 misfire grace / coalesce 동작은 사용하지
+> 못한다. 안정성을 원하면 방식 C(systemd) 를 쓸 것.
 
 ---
 

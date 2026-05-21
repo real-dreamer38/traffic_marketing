@@ -379,6 +379,75 @@ hr { border-color: #e5e7eb !important; opacity: 1; margin: 1.5rem 0; }
     color: #64748b !important;
     font-weight: 400;
 }
+
+/* ── 상품 관리 — 인라인 표 (per-row 삭제 / 토글) ───────────── */
+.prod-table-head {
+    display: flex;
+    align-items: center;
+    padding: 0 4px 8px 4px;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.tr-cell {
+    padding: 6px 4px;
+    font-size: 0.9rem;
+    color: #0f172a;
+    display: flex;
+    align-items: center;
+    min-height: 38px;
+}
+.tr-cell.muted { color: #64748b; font-size: 0.86rem; }
+.tr-cell.strong { font-weight: 600; }
+.tr-cell.mono { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+
+/* tighten button row spacing inside the manage tab */
+[data-testid="stHorizontalBlock"] .stButton > button {
+    padding: 6px 10px;
+    font-size: 0.84rem;
+    min-height: 34px;
+    line-height: 1;
+}
+
+/* 삭제 버튼 — 빨간 톤 (secondary 인데 danger 처럼) */
+.stButton > button.danger,
+button[data-testid="baseButton-secondary"][title*="삭제"] {
+    color: #b91c1c !important;
+    border-color: #fecaca !important;
+}
+.stButton > button.danger:hover,
+button[data-testid="baseButton-secondary"][title*="삭제"]:hover {
+    background: #fef2f2 !important;
+    border-color: #fca5a5 !important;
+    color: #991b1b !important;
+}
+
+/* dialog 본문 */
+.delete-dialog-msg {
+    font-size: 1rem;
+    color: #0f172a;
+    line-height: 1.5;
+    margin-bottom: 6px;
+}
+.delete-dialog-name {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 12px 0 14px 0;
+    font-size: 0.95rem;
+    color: #991b1b;
+    font-weight: 600;
+}
+.delete-dialog-warn {
+    font-size: 0.85rem;
+    color: #64748b;
+    margin-bottom: 16px;
+    line-height: 1.5;
+}
 </style>"""
 
 st.markdown(CSS, unsafe_allow_html=True)
@@ -775,6 +844,45 @@ def load_management_overview() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+@st.dialog("⚠️ 상품 삭제 확인")
+def _confirm_delete_dialog() -> None:
+    pending = st.session_state.get("pending_delete")
+    if not pending:
+        return
+
+    name_esc = _html.escape(pending["name"])
+
+    st.markdown(
+        "<div class='delete-dialog-msg'>해당 상품을 영구 삭제하시겠습니까?</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='delete-dialog-name'>🗑️ {name_esc}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='delete-dialog-warn'>"
+        "이 작업은 되돌릴 수 없습니다.<br>"
+        "해당 상품의 <b>순위 이력 · 경쟁사 스냅샷 · 트래픽 로그</b>가 함께 삭제됩니다."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns([1, 1])
+    if c1.button("취소", use_container_width=True, key="dlg_cancel_delete"):
+        st.session_state.pop("pending_delete", None)
+        st.rerun()
+    if c2.button("삭제하기", type="primary", use_container_width=True, key="dlg_confirm_delete"):
+        deleted = db.delete_product(pending["id"])
+        st.session_state.pop("pending_delete", None)
+        st.cache_data.clear()
+        if deleted:
+            st.toast(f"상품을 삭제했습니다: {pending['name']}", icon="🗑️")
+        else:
+            st.toast("이미 삭제된 항목입니다.", icon="⚠️")
+        st.rerun()
+
+
 def render_manage_tab() -> None:
     all_products_full = [dict(p) for p in db.list_products(active_only=False)]
 
@@ -891,43 +999,95 @@ def render_manage_tab() -> None:
                     st.cache_data.clear()
                     st.rerun()
 
-    # ── 우측 카드: 상품 목록 + 빠른 작업 ───────────────────
+    # ── 우측 카드: 상품 목록 (per-row 토글 / 삭제) ─────────
     with right:
         with st.container(border=True):
             st.markdown('<div class="section-title">등록 상품 목록</div>',
                         unsafe_allow_html=True)
 
-            overview_df = load_management_overview()
-            if overview_df.empty:
+            if not all_products_full:
                 st.caption("등록된 상품이 없습니다. 좌측에서 추가해 주세요.")
-                return
+            else:
+                # 컬럼 비율: ID · 상품명 · 키워드 · 플랫폼 · 현재 순위 · 토글 · 삭제
+                col_ratios = [0.45, 2.1, 1.6, 0.9, 1.0, 1.0, 0.7]
+                header_labels = ["ID", "상품명", "키워드", "플랫폼",
+                                 "현재 순위", "상태", ""]
 
-            column_order = ["ID", "상품명", "키워드", "플랫폼",
-                            "현재 순위", "등록일", "상태"]
-            st.dataframe(
-                _center_styled(overview_df[column_order]),
-                use_container_width=True,
-                hide_index=True,
-            )
+                hdr_cols = st.columns(col_ratios)
+                for i, label in enumerate(header_labels):
+                    hdr_cols[i].markdown(
+                        f"<div class='prod-table-head' style='border:none;padding:4px 4px;'>{label}</div>",
+                        unsafe_allow_html=True,
+                    )
 
-            st.caption(f"총 {len(overview_df)}개 상품")
+                st.markdown(
+                    "<hr style='margin:2px 0 6px 0;border:0;border-top:1px solid #e5e7eb;'/>",
+                    unsafe_allow_html=True,
+                )
 
-            st.markdown('<div class="section-title" style="margin-top:1.2rem;">빠른 작업</div>',
-                        unsafe_allow_html=True)
-            action_labels = [f"[{p['id']}] {p['name']}" for p in all_products_full]
-            action_pick = st.selectbox(
-                "대상 상품",
-                action_labels,
-                key="manage_action_target_select",
-                label_visibility="collapsed",
-            )
-            action_target = all_products_full[action_labels.index(action_pick)]
-            is_active = bool(action_target["active"])
-            toggle_label = "비활성화" if is_active else "활성화"
-            if st.button(toggle_label, key="manage_toggle_btn", use_container_width=True):
-                db.update_product(action_target["id"], active=not is_active)
-                st.cache_data.clear()
-                st.rerun()
+                for product in all_products_full:
+                    latest    = db.get_latest_rank(product["id"])
+                    rank_now  = latest["rank"] if latest else 0
+                    rank_str  = "미노출" if rank_now == 0 else f"{rank_now}위"
+                    is_active = bool(product["active"])
+                    platform_kr = PLATFORM_KR.get(product["platform"], product["platform"])
+                    name_esc    = _html.escape(product["name"])
+                    keyword_esc = _html.escape(product["keyword"])
+
+                    row = st.columns(col_ratios)
+                    row[0].markdown(
+                        f"<div class='tr-cell muted mono'>#{product['id']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row[1].markdown(
+                        f"<div class='tr-cell strong'>{name_esc}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row[2].markdown(
+                        f"<div class='tr-cell muted'>{keyword_esc}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row[3].markdown(
+                        f"<div class='tr-cell'>{platform_kr}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    rank_pill_class = "pill pill-slate" if rank_now == 0 else "pill pill-blue"
+                    row[4].markdown(
+                        f"<div class='tr-cell'><span class='{rank_pill_class}'>{rank_str}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    toggle_label = "비활성" if is_active else "활성"
+                    toggle_help  = "지금 비활성화" if is_active else "지금 활성화"
+                    if row[5].button(
+                        toggle_label,
+                        key=f"toggle_btn_{product['id']}",
+                        use_container_width=True,
+                        help=toggle_help,
+                        type="primary" if is_active else "secondary",
+                    ):
+                        db.update_product(product["id"], active=not is_active)
+                        st.cache_data.clear()
+                        st.rerun()
+
+                    if row[6].button(
+                        "삭제",
+                        key=f"delete_btn_{product['id']}",
+                        use_container_width=True,
+                        help=f"상품 '{product['name']}' 삭제",
+                    ):
+                        st.session_state["pending_delete"] = {
+                            "id":   product["id"],
+                            "name": product["name"],
+                        }
+                        st.rerun()
+
+                st.caption(f"총 {len(all_products_full)}개 상품")
+
+            # 삭제 확정 다이얼로그 — session_state 에 pending 이 있으면 표시
+            if st.session_state.get("pending_delete"):
+                _confirm_delete_dialog()
 
 
 # ---------------------------------------------------------------------------

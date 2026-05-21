@@ -6,7 +6,7 @@ Usage
     # Run once immediately (cron / manual test)
     python scheduler.py --now
 
-    # Run as an in-process daily daemon (기본 오전 8:00 KST)
+    # Run as an in-process daily daemon (기본 매일 오전 9:00 KST)
     python scheduler.py --schedule
     python scheduler.py --schedule --hour 9 --minute 30
 
@@ -16,8 +16,13 @@ Usage
 Environment variables (.env)
     TELEGRAM_BOT_TOKEN   텔레그램 봇 API 토큰
     TELEGRAM_CHAT_ID     리포트를 받을 챗 ID
-    REPORT_HOUR          스케줄 시각 (기본 8)
+    REPORT_HOUR          스케줄 시각 (KST, 기본 9)
     REPORT_MINUTE        스케줄 분   (기본 0)
+
+Timezone
+    APScheduler 의 BlockingScheduler / CronTrigger 모두 timezone="Asia/Seoul"
+    로 고정되어 있어 서버 OS 의 UTC/Local 시간대와 무관하게 한국 시간(KST)
+    기준 09:00 에 정확히 실행됩니다.
 """
 
 import argparse
@@ -409,9 +414,16 @@ def _log_report_to_console(items: list[ReportItem]) -> None:
 def start_scheduler(
     bot_token: str = "",
     chat_id:  str = "",
-    hour:     int = 8,
+    hour:     int = 9,
     minute:   int = 0,
 ) -> None:
+    """
+    매일 KST 기준 hour:minute 에 run_daily_report 를 실행하는 데몬.
+
+    BlockingScheduler 와 CronTrigger 모두 timezone="Asia/Seoul" 로 명시되어
+    있어 서버의 시스템 시간이 UTC 든 다른 지역이든 상관없이 한국 시간 기준
+    오전 9시에 정확히 발화한다. (오라클/AWS Ubuntu 기본은 UTC)
+    """
     bot_token = bot_token or TELEGRAM_BOT_TOKEN
     chat_id   = chat_id   or TELEGRAM_CHAT_ID
 
@@ -456,8 +468,10 @@ def _parse_args() -> argparse.Namespace:
                         help="Telegram bot token (overrides TELEGRAM_BOT_TOKEN env var).")
     parser.add_argument("--chat",   default="", metavar="CHAT_ID",
                         help="Telegram chat ID (overrides TELEGRAM_CHAT_ID env var).")
-    parser.add_argument("--hour",   type=int, default=int(os.getenv("REPORT_HOUR",   "8")))
-    parser.add_argument("--minute", type=int, default=int(os.getenv("REPORT_MINUTE", "0")))
+    parser.add_argument("--hour",   type=int, default=int(os.getenv("REPORT_HOUR",   "9")),
+                        help="KST 기준 실행 시각 (기본 9)")
+    parser.add_argument("--minute", type=int, default=int(os.getenv("REPORT_MINUTE", "0")),
+                        help="KST 기준 실행 분 (기본 0)")
     return parser.parse_args()
 
 
