@@ -19,10 +19,14 @@ Environment variables (.env)
     REPORT_HOUR          스케줄 시각 (KST, 기본 9)
     REPORT_MINUTE        스케줄 분   (기본 0)
 
+리포트 구조
+    · 네이버 / 쿠팡 각각 '별도의 텔레그램 메시지'로 분리 발송한다.
+    · 각 플랫폼 메시지 안에서 상품을 '품목(product group)' 단위로 묶어 보여준다.
+    · 차단(blocked)·오류(error)·미노출(not_found) 상태는 순위 대신 상태 칩으로 표기.
+
 Timezone
     APScheduler 의 BlockingScheduler / CronTrigger 모두 timezone="Asia/Seoul"
-    로 고정되어 있어 서버 OS 의 UTC/Local 시간대와 무관하게 한국 시간(KST)
-    기준 09:00 에 정확히 실행됩니다.
+    로 고정되어 한국 시간(KST) 기준 09:00 에 정확히 실행됩니다.
 """
 
 import argparse
@@ -30,6 +34,7 @@ import asyncio
 import html
 import logging
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -60,11 +65,11 @@ TELEGRAM_API_URL   = "https://api.telegram.org/bot{token}/sendMessage"
 
 PLATFORM_DISPLAY = {"naver": "네이버", "coupang": "쿠팡"}
 PLATFORM_EMOJI   = {"naver": "🟢", "coupang": "🔴"}
-# 텔레그램 리포트에서 플랫폼별 섹션을 시각적으로 분리하기 위한 헤더.
 PLATFORM_SECTION = {
-    "naver":   "🟢 <b>[ 네이버 쇼핑 순위 ]</b>",
-    "coupang": "🔴 <b>[ 쿠팡 로켓/일반 순위 ]</b>",
+    "naver":   "🟢 <b>네이버 쇼핑 순위 리포트</b>",
+    "coupang": "🔴 <b>쿠팡 순위 리포트</b>",
 }
+UNGROUPED_LABEL = "(미분류)"
 SECTION_DIVIDER = "━━━━━━━━━━━━━━━━━━"
 WEEKDAYS_KR     = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -82,7 +87,27 @@ class ReportItem:
     today_rank:      int
     yesterday_rank:  Optional[int]
     delta:           Optional[int]
-    scrape_error:    Optional[str] = None
+    status:          str = "ok"               # ok | not_found | blocked | error
+    group_name:      Optional[str] = None     # 소속 품목명 (없으면 None)
+    scrape_error:    Optional[str] = None      # 배치 전체 크래시 등 치명적 오류 메시지
+
+    @property
+    def measured_failed(self) -> bool:
+        """순위 측정 자체가 실패(차단/오류)했는지 — 미노출(not_found)과 구분."""
+        return self.status in ("blocked", "error") or self.scrape_error is not None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _row_get(row, key, default=None):
+    """sqlite3.Row / dict 모두에서 안전하게 키를 읽는다."""
+    try:
+        val = row[key]
+        return val if val is not None else default
+    except (KeyError, IndexError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +118,7 @@ def _build_report_item(
     product:       "dict | db.sqlite3.Row",
     today_rank:    int,
     today_page:    Optional[int],
+    status:        str = "ok",
     scrape_error:  Optional[str] = None,
     persist_today: bool = True,
     db_path=None,
@@ -102,12 +128,16 @@ def _build_report_item(
 
     pid = product["id"]
 
+    # 배치 전체가 크래시한 경우(scrape_error)에는 측정값이 없어 저장하지 않는다.
+    # 그 외에는 ok/not_found/blocked/error 상태를 그대로 저장 — HTML 이 아니라
+    # '상태값'으로 명확히 기록한다.
     if persist_today and scrape_error is None:
         db.upsert_rank(
             product_id=pid,
             rank=today_rank,
             rank_date=date.today(),
             page=today_page,
+            status=status,
             db_path=db_path,
         )
 
@@ -127,6 +157,8 @@ def _build_report_item(
         today_rank    = today_rank,
         yesterday_rank= yesterday_rank,
         delta         = delta,
+        status        = status,
+        group_name    = _row_get(product, "group_name"),
         scrape_error  = scrape_error,
     )
 
@@ -157,7 +189,7 @@ async def _run_scrape_and_save() -> list[ReportItem]:
         log.error("Scraper crashed: %s", e, exc_info=True)
         err_msg = f"스크래퍼 실행 실패: {type(e).__name__}: {e}"
         return [
-            _build_report_item(p, today_rank=0, today_page=None,
+            _build_report_item(p, today_rank=0, today_page=None, status="error",
                                scrape_error=err_msg, persist_today=False)
             for p in products
         ]
@@ -173,17 +205,20 @@ async def _run_scrape_and_save() -> list[ReportItem]:
         result = result_map.get(key)
         today_rank = result.rank if result else 0
         today_page = result.page if result else None
+        status     = result.status if result else "error"
         report_items.append(
             _build_report_item(
                 product       = p,
                 today_rank    = today_rank,
                 today_page    = today_page,
+                status        = status,
                 scrape_error  = None,
                 persist_today = True,
             )
         )
 
-        if result and result.top5:
+        # 경쟁사 Top5 는 정상/미노출 상태에서만 신뢰 — 차단·오류 시엔 저장하지 않는다.
+        if result and result.top5 and result.status in ("ok", "not_found"):
             try:
                 db.upsert_competitor_ranks(
                     product_id=p["id"],
@@ -205,63 +240,65 @@ def _fmt_rank(rank: int) -> str:
     return "미노출" if rank == 0 else f"{rank}위"
 
 
-def _fmt_delta(delta: Optional[int], today: int, yesterday: Optional[int]) -> str:
-    """순위 변동 라벨 — 🔺 상승 / 🔻 하락 / ➖ 변동없음 / 신규 / 미노출"""
-    if yesterday is None:
-        return "🆕 신규"
-    if today == 0:
-        return "⛔ 미노출"
-    if delta is None:
-        return "➖"
-    if delta > 0:
-        return f"🔺 {delta}"
-    if delta < 0:
-        return f"🔻 {abs(delta)}"
-    return "➖"
+def _fmt_status_cell(it: ReportItem) -> str:
+    """상품 한 줄의 '순위 + 상태' 표기 — HTML 이 아닌 상태 라벨로만 출력."""
+    if it.status == "blocked":
+        return "⛔ <b>차단</b>"
+    if it.status == "error":
+        return "⚠️ <b>오류</b>"
+    if it.today_rank == 0 or it.status == "not_found":
+        return "<b>미노출</b>"
+
+    rank_str = f"<b>{it.today_rank}위</b>"
+    if it.yesterday_rank is None:
+        return f"{rank_str}  🆕 신규"
+    if it.delta is None:
+        return f"{rank_str}  ➖"
+    if it.delta > 0:
+        return f"{rank_str}  🔺 {it.delta}"
+    if it.delta < 0:
+        return f"{rank_str}  🔻 {abs(it.delta)}"
+    return f"{rank_str}  ➖ 유지"
 
 
 def _platform_subtotal(items: list[ReportItem]) -> str:
-    """플랫폼 섹션 하단에 붙는 한 줄 요약."""
-    ok       = [it for it in items if not it.scrape_error]
-    exposed  = sum(1 for it in ok if it.today_rank > 0)
-    improved = sum(1 for it in ok if it.delta and it.delta > 0)
-    worsened = sum(1 for it in ok if it.delta and it.delta < 0)
-    failed   = sum(1 for it in items if it.scrape_error)
+    """플랫폼 메시지 하단 한 줄 요약."""
+    measurable = [it for it in items if not it.measured_failed]
+    exposed  = sum(1 for it in measurable if it.today_rank > 0)
+    improved = sum(1 for it in measurable if it.delta and it.delta > 0)
+    worsened = sum(1 for it in measurable if it.delta and it.delta < 0)
+    blocked  = sum(1 for it in items if it.status == "blocked")
+    errored  = sum(1 for it in items if it.status == "error" or it.scrape_error)
+
     parts = [
-        f"📈 노출 <b>{exposed}/{len(ok)}</b>",
+        f"노출 <b>{exposed}/{len(measurable)}</b>",
         f"🔺 <b>{improved}</b>",
         f"🔻 <b>{worsened}</b>",
     ]
-    if failed:
-        parts.append(f"⚠️ 실패 <b>{failed}</b>")
-    return "└ " + " · ".join(parts)
+    if blocked:
+        parts.append(f"⛔ 차단 <b>{blocked}</b>")
+    if errored:
+        parts.append(f"⚠️ 오류 <b>{errored}</b>")
+    return "📊 " + " · ".join(parts)
 
 
-def build_telegram_message(items: list[ReportItem]) -> str:
-    """
-    텔레그램 HTML 파스 모드 메시지를 생성한다.
-
-    네이버/쿠팡 섹션을 시각적으로 분리해 가독성을 높인다.
+def build_platform_message(platform: str, items: list[ReportItem]) -> str:
+    """한 플랫폼(네이버/쿠팡)의 텔레그램 메시지를 품목 단위로 묶어 생성한다.
 
     구조 예시:
-        📊 <b>데일리 순위 모니터링 리포트</b>
-        🗓️ 2026-05-20 (수) 08:00
+        🟢 네이버 쇼핑 순위 리포트
+        🗓️ 2026-05-22 (목) 09:00
         ━━━━━━━━━━━━━━━━━━
 
-        🟢 <b>[ 네이버 쇼핑 순위 ]</b>
-          • <b>친환경 에어캡</b> — 8위  🔺 2
-          • <b>천연 비누</b>    — 미노출  ⛔
-        └ 📈 노출 1/2 · 🔺 1 · 🔻 0
+        📦 에코앤팩 친환경 에어캡
+          • 에어캡 10mm — 8위  🔺 2
+          • 에어캡 20mm — 22위  🔻 3
+
+        📦 (미분류)
+          • 천연 비누 — 미노출
 
         ━━━━━━━━━━━━━━━━━━
-
-        🔴 <b>[ 쿠팡 로켓/일반 순위 ]</b>
-          • <b>고체 치약</b>   — 5위  ➖
-        └ 📈 노출 1/1 · 🔺 0 · 🔻 0
-
-        ━━━━━━━━━━━━━━━━━━
-        📊 <b>전체 요약</b>
-        📈 노출 2/3 · 🔺 상승 1 · 🔻 하락 0
+        📊 노출 2/3 · 🔺 1 · 🔻 1
     """
     now = datetime.now()
     date_str = (
@@ -270,59 +307,27 @@ def build_telegram_message(items: list[ReportItem]) -> str:
     )
 
     lines: list[str] = [
-        "📊 <b>데일리 순위 모니터링 리포트</b>",
+        PLATFORM_SECTION.get(platform, f"<b>{html.escape(platform)} 순위 리포트</b>"),
         f"🗓️ <i>{html.escape(date_str)}</i>",
         SECTION_DIVIDER,
         "",
     ]
 
-    rendered_section = False
-    for platform in ("naver", "coupang"):
-        platform_items = [it for it in items if it.platform == platform]
-        if not platform_items:
-            continue
+    # 품목(group)별로 묶는다 — 입력 items 는 이미 그룹 순으로 정렬돼 있다.
+    grouped: "OrderedDict[str, list[ReportItem]]" = OrderedDict()
+    for it in items:
+        gname = it.group_name or UNGROUPED_LABEL
+        grouped.setdefault(gname, []).append(it)
 
-        if rendered_section:
-            # 이전 플랫폼 섹션과 시각적으로 끊는다
-            lines.append(SECTION_DIVIDER)
-            lines.append("")
-
-        lines.append(PLATFORM_SECTION[platform])
-
-        for it in platform_items:
+    for gname, g_items in grouped.items():
+        lines.append(f"📦 <b>{html.escape(gname)}</b>")
+        for it in g_items:
             name_esc = html.escape(it.name)
-            if it.scrape_error:
-                err_esc = html.escape(it.scrape_error[:60])
-                lines.append(
-                    f"  • <b>{name_esc}</b> — ⚠️ 조회실패  <code>{err_esc}</code>"
-                )
-                continue
-
-            rank_str  = _fmt_rank(it.today_rank)
-            delta_str = _fmt_delta(it.delta, it.today_rank, it.yesterday_rank)
-            lines.append(f"  • <b>{name_esc}</b> — <b>{rank_str}</b>  {delta_str}")
-
-        # 플랫폼별 미니 요약
-        lines.append(_platform_subtotal(platform_items))
+            lines.append(f"  • {name_esc} — {_fmt_status_cell(it)}")
         lines.append("")
-        rendered_section = True
-
-    # 전체 요약 푸터
-    scrape_ok = [it for it in items if not it.scrape_error]
-    failed    = sum(1 for it in items if it.scrape_error)
-    exposed   = sum(1 for it in scrape_ok if it.today_rank > 0)
-    improved  = sum(1 for it in scrape_ok if it.delta and it.delta > 0)
-    worsened  = sum(1 for it in scrape_ok if it.delta and it.delta < 0)
 
     lines.append(SECTION_DIVIDER)
-    lines.append("📊 <b>전체 요약</b>")
-    footer = (
-        f"📈 노출 <b>{exposed}/{len(scrape_ok)}</b> · "
-        f"🔺 상승 <b>{improved}</b> · 🔻 하락 <b>{worsened}</b>"
-    )
-    if failed:
-        footer += f" · ⚠️ 조회실패 <b>{failed}</b>"
-    lines.append(footer)
+    lines.append(_platform_subtotal(items))
 
     return "\n".join(lines)
 
@@ -395,6 +400,27 @@ def send_telegram_message(
     return False
 
 
+def _dispatch_platform_reports(
+    items: list[ReportItem],
+    bot_token: str,
+    chat_id: str,
+) -> None:
+    """네이버/쿠팡 메시지를 각각 별도로 전송한다 (플랫폼별 분리 발송)."""
+    if not (bot_token and chat_id):
+        log.warning("Telegram 설정(TELEGRAM_BOT_TOKEN/CHAT_ID) 누락 — 알림 스킵.")
+        return
+
+    for platform in ("naver", "coupang"):
+        platform_items = [it for it in items if it.platform == platform]
+        if not platform_items:
+            continue
+        message = build_platform_message(platform, platform_items)
+        ok = send_telegram_message(message, bot_token, chat_id)
+        log.info("[%s] 플랫폼 리포트 전송 %s",
+                 PLATFORM_DISPLAY.get(platform, platform),
+                 "성공" if ok else "실패")
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -405,6 +431,7 @@ def run_daily_report(
 ) -> list[ReportItem]:
     """
     Full pipeline: scrape → save to DB → send Telegram notification.
+    네이버/쿠팡을 분리해 각각 별도 메시지로 발송한다.
     Returns the list of ReportItems for inspection / testing.
     """
     bot_token = bot_token or TELEGRAM_BOT_TOKEN
@@ -428,11 +455,7 @@ def run_daily_report(
         return []
 
     _log_report_to_console(items)
-
-    if bot_token and chat_id:
-        send_telegram_message(build_telegram_message(items), bot_token, chat_id)
-    else:
-        log.warning("Telegram 설정(TELEGRAM_BOT_TOKEN/CHAT_ID) 누락 — 알림 스킵.")
+    _dispatch_platform_reports(items, bot_token, chat_id)
 
     log.info("=== Daily rank report finished ===")
     return items
@@ -441,16 +464,31 @@ def run_daily_report(
 def _log_report_to_console(items: list[ReportItem]) -> None:
     now = datetime.now()
     print(f"\n[📊 데일리 순위 모니터링 리포트] — {now.strftime('%Y-%m-%d')} ({WEEKDAYS_KR[now.weekday()]})")
-    print("-" * 50)
-    for it in items:
-        platform_kr = PLATFORM_DISPLAY[it.platform]
-        if it.scrape_error:
-            print(f"  - {it.name} ({platform_kr}): 조회실패 ({it.scrape_error[:60]})")
+    for platform in ("naver", "coupang"):
+        platform_items = [it for it in items if it.platform == platform]
+        if not platform_items:
             continue
-        rank_str    = _fmt_rank(it.today_rank)
-        delta_str   = _fmt_delta(it.delta, it.today_rank, it.yesterday_rank)
-        print(f"  - {it.name} ({platform_kr}): {rank_str} ({delta_str})")
-    print("-" * 50)
+        print("-" * 56)
+        print(f"  {PLATFORM_EMOJI.get(platform,'')} {PLATFORM_DISPLAY.get(platform, platform)}")
+        current_group = object()
+        for it in platform_items:
+            gname = it.group_name or UNGROUPED_LABEL
+            if gname != current_group:
+                current_group = gname
+                print(f"  📦 {gname}")
+            if it.status == "blocked":
+                state = "차단(blocked)"
+            elif it.status == "error" or it.scrape_error:
+                state = "오류(error)"
+            elif it.today_rank == 0:
+                state = "미노출"
+            else:
+                d = it.delta
+                arrow = "신규" if it.yesterday_rank is None else (
+                    f"▲{d}" if d and d > 0 else f"▼{abs(d)}" if d and d < 0 else "유지")
+                state = f"{it.today_rank}위 ({arrow})"
+            print(f"     - {it.name}: {state}")
+    print("-" * 56)
 
 
 # ---------------------------------------------------------------------------
@@ -543,16 +581,22 @@ if __name__ == "__main__":
             latest = db.get_latest_rank(p["id"])
             today_rank = latest["rank"] if latest else 0
             today_page = latest["page"] if latest else None
+            status     = _row_get(latest, "status", "ok") if latest else "ok"
             preview_items.append(
                 _build_report_item(
                     product       = p,
                     today_rank    = today_rank,
                     today_page    = today_page,
+                    status        = status,
                     scrape_error  = None,
                     persist_today = False,
                 )
             )
 
         _log_report_to_console(preview_items)
-        print("\n--- Telegram HTML message preview ---")
-        print(build_telegram_message(preview_items))
+        for platform in ("naver", "coupang"):
+            platform_items = [it for it in preview_items if it.platform == platform]
+            if not platform_items:
+                continue
+            print(f"\n--- Telegram HTML message preview ({PLATFORM_DISPLAY[platform]}) ---")
+            print(build_platform_message(platform, platform_items))

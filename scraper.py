@@ -18,8 +18,18 @@ Public API
     result = asyncio.run(get_rank("naver",   keyword, target_id))
     result = asyncio.run(get_rank("coupang", keyword, target_id))
 
-    RankResult.rank  : int  — 1-based absolute position; 0 = not found
-    RankResult.page  : int  — result page number where found (None if not found)
+    RankResult.rank   : int  — 1-based absolute position; 0 = not found
+    RankResult.page   : int  — result page number where found (None if not found)
+    RankResult.status : str  — ok | not_found | blocked | error
+
+차단 페이지 처리
+----------------
+쿠팡/네이버가 캡차·Access Denied 페이지를 돌려주면 그 안의 HTML/스크립트가
+상품명·순위로 잘못 흘러 들어갈 수 있다. 이를 막기 위해:
+  · 추출 0건일 때 _looks_blocked() 로 차단 페이지를 판별 → status='blocked'
+  · 모든 상품명은 _sanitize_name() 으로 HTML 태그·코드 블롭을 제거
+순위 추출 실패 시 RankResult.rank 는 항상 0, status 로만 원인을 표현한다.
+HTML 원문은 절대 결과에 담기지 않는다.
 """
 
 import asyncio
@@ -151,6 +161,13 @@ class AuthSessionMissingError(RuntimeError):
     """./auth_session 이 비어 있거나 없을 때 발생. 호출자가 잡아 복구해야 한다."""
 
 
+# 스크래핑 결과 상태 — database.py 의 RANK_STATUS_* 와 문자열 값이 일치해야 한다.
+STATUS_OK        = "ok"         # 정상 (rank 발견 / 검색 후 미발견)
+STATUS_NOT_FOUND = "not_found"  # 검색은 됐으나 N페이지 내 미노출
+STATUS_BLOCKED   = "blocked"    # 차단·캡차 페이지 수신 — 순위 신뢰 불가
+STATUS_ERROR     = "error"      # 스크래퍼 예외 — 측정 자체 실패
+
+
 @dataclass
 class RankResult:
     rank: int                # 0 = not found
@@ -159,10 +176,83 @@ class RankResult:
     platform: str
     target_id: str
     top5: list[dict] = None  # [{"rank": int, "name": str, "target_id": str}], page1 기준 Top 5
+    status: str = STATUS_OK  # ok | not_found | blocked | error
 
     def __post_init__(self):
         if self.top5 is None:
             self.top5 = []
+
+
+# ---------------------------------------------------------------------------
+# Data sanitisation & block-page detection
+# ---------------------------------------------------------------------------
+# Why: 쿠팡/네이버의 차단·캡차 페이지에는 인라인 <script>/JSON 블롭이 가득하다.
+# DOM 의 'title' 후보 셀렉터가 이런 스크립트 노드를 잡으면, 그 코드 텍스트가
+# 그대로 상품명/경쟁사명으로 흘러 들어가 대시보드에 'HTML 소스코드'처럼 노출됐다.
+# 아래 두 함수로 (1) 모든 상품명을 정제하고 (2) 차단 페이지를 명시적으로 감지한다.
+
+_TAG_RE     = re.compile(r"<[^>]*>")
+_WS_RE      = re.compile(r"\s+")
+_CODE_HINTS = ("function(", "function ", "var ", "{", "}", "</", "/>",
+               "window.", "document.", "=>", "();", "addeventlistener")
+
+# 차단/캡차 페이지 시그널 — 정상 검색결과에는 거의 등장하지 않는 문구만 선별
+_BLOCK_TITLE_SIGNS = (
+    "access denied", "blocked", "robot", "captcha",
+    "보안", "비정상", "접근이 거부", "잠시 후 다시",
+)
+_BLOCK_BODY_SIGNS = (
+    "access denied", "automated access", "unusual traffic",
+    "비정상적인 접근", "비정상적인 요청", "자동 입력 방지",
+    "보안문자", "로봇이 아닙니다", "ip가 차단", "잠시 후 다시 시도",
+)
+
+
+def _sanitize_name(raw: Optional[str]) -> str:
+    """스크래핑한 상품명을 안전한 한 줄 문자열로 정제한다.
+
+    - HTML 태그 제거 + 공백 정규화
+    - 중괄호/function 등 코드 힌트가 2개 이상이면 스크립트 블롭으로 보고 폐기("")
+    - 100자 초과 시 잘라낸다
+    호출자는 빈 문자열을 '(이름없음)' 등으로 폴백 처리한다.
+    """
+    if not raw:
+        return ""
+    txt = _TAG_RE.sub(" ", str(raw))
+    txt = _WS_RE.sub(" ", txt).strip()
+    if not txt:
+        return ""
+    low = txt.lower()
+    if sum(low.count(h) for h in _CODE_HINTS) >= 2:
+        return ""
+    if len(txt) > 100:
+        txt = txt[:100].rstrip()
+    return txt
+
+
+async def _looks_blocked(page: Page) -> bool:
+    """차단/캡차 페이지인지 판별한다 — 상품 추출이 0건일 때만 호출한다.
+
+    정상 페이지 오탐을 줄이기 위해 추출 실패 이후에만 검사하며, 제목/본문의
+    차단 시그널 또는 비정상적으로 짧은 본문 길이로 판단한다.
+    """
+    try:
+        title = (await page.title() or "").lower()
+    except Exception:
+        title = ""
+    try:
+        body = (await page.content() or "")[:8_000].lower()
+    except Exception:
+        body = ""
+
+    if any(sign in title for sign in _BLOCK_TITLE_SIGNS):
+        return True
+    if any(sign in body for sign in _BLOCK_BODY_SIGNS):
+        return True
+    # 정상 검색결과 HTML 은 보통 수십 KB. 본문이 지나치게 짧으면 차단/에러 페이지.
+    if body and len(body) < 1_200:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +479,7 @@ async def _extract_naver_items(page: Page) -> list[dict]:
         log.debug("[Naver] JS raw anchors count: %d", len(raw))
         for entry in raw:
             href = entry.get("href") or ""
-            name = (entry.get("name") or "").strip()
+            name = _sanitize_name(entry.get("name"))
             for pat in _NAVER_ID_PATTERNS:
                 m = pat.search(href)
                 if m:
@@ -505,7 +595,7 @@ async def _extract_coupang_items(page: Page) -> list[dict]:
             pid = (entry.get("id") or "").strip()
             if not pid:
                 continue
-            items.append({"id": pid, "name": (entry.get("name") or "").strip()})
+            items.append({"id": pid, "name": _sanitize_name(entry.get("name"))})
         items = _dedupe_items(items)
         if items:
             log.debug("[Coupang] JS strategy: %d items — sample: %s",
@@ -583,16 +673,19 @@ async def _search_naver(
     keyword: str,
     target_id: str,
     max_pages: int,
-) -> tuple[int, Optional[int], list[dict]]:
+) -> tuple[int, Optional[int], list[dict], str]:
     """
-    Returns (rank, page_num, top5).
-    top5: [{"rank": int, "name": str, "target_id": str}] — 1페이지 첫 5개 (실패 시 [])
+    Returns (rank, page_num, top5, status).
+    top5  : [{"rank": int, "name": str, "target_id": str}] — 1페이지 첫 5개 (실패 시 [])
+    status: ok | not_found | blocked | error
     """
     page = await context.new_page()
     global_rank = 0
     top5: list[dict] = []
     found_rank: int = 0
     found_page: Optional[int] = None
+    blocked: bool = False
+    errored: bool = False
 
     # 쿠키 워밍 — auth_session 의 쿠키가 갱신되도록 메인 먼저 방문
     await _warm_up(page, "https://shopping.naver.com/")
@@ -603,6 +696,8 @@ async def _search_naver(
             log.info("[Naver] keyword=%r  page=%d  URL: %s", keyword, page_num, url)
 
             if not await _navigate_safe(page, url):
+                if page_num == 1:
+                    errored = True  # 첫 페이지 진입 자체 실패 → 측정 불가
                 break
 
             # 상품 목록 렌더링 대기 — 여러 셀렉터 순차 시도
@@ -630,6 +725,10 @@ async def _search_naver(
 
             if not items:
                 log.warning("[Naver] page %d: 상품 ID 추출 실패 (0건)", page_num)
+                if await _looks_blocked(page):
+                    log.warning("[Naver] page %d: 차단/캡차 페이지로 판단 — status=blocked",
+                                page_num)
+                    blocked = True
                 await _diagnose_page(page, "naver", page_num)
                 break
 
@@ -659,19 +758,26 @@ async def _search_naver(
 
             # 1페이지를 처리한 뒤 이미 발견했고 top5 도 확보했으면 조기 종료
             if found_rank and top5:
-                return found_rank, found_page, top5
+                return found_rank, found_page, top5, STATUS_OK
 
             await page.wait_for_timeout(random.randint(1_000, 2_000))
 
     except Exception as e:
         log.error("[Naver] 처리되지 않은 예외: %s", e, exc_info=True)
+        errored = True
     finally:
         await page.close()
 
     if found_rank:
-        return found_rank, found_page, top5
+        return found_rank, found_page, top5, STATUS_OK
+    if errored:
+        log.info("[Naver] target_id=%r — 스크래퍼 오류로 측정 실패", target_id)
+        return 0, None, top5, STATUS_ERROR
+    if blocked:
+        log.info("[Naver] target_id=%r — 차단 페이지로 측정 실패", target_id)
+        return 0, None, top5, STATUS_BLOCKED
     log.info("[Naver] target_id=%r — %d페이지 내 미발견", target_id, max_pages)
-    return 0, None, top5
+    return 0, None, top5, STATUS_NOT_FOUND
 
 
 async def _search_coupang(
@@ -679,16 +785,19 @@ async def _search_coupang(
     keyword: str,
     target_id: str,
     max_pages: int,
-) -> tuple[int, Optional[int], list[dict]]:
+) -> tuple[int, Optional[int], list[dict], str]:
     """
-    Returns (rank, page_num, top5).
-    top5: [{"rank": int, "name": str, "target_id": str}]
+    Returns (rank, page_num, top5, status).
+    top5  : [{"rank": int, "name": str, "target_id": str}]
+    status: ok | not_found | blocked | error
     """
     page = await context.new_page()
     global_rank = 0
     top5: list[dict] = []
     found_rank: int = 0
     found_page: Optional[int] = None
+    blocked: bool = False
+    errored: bool = False
 
     await _warm_up(page, "https://www.coupang.com/")
 
@@ -702,6 +811,8 @@ async def _search_coupang(
             log.info("[Coupang] keyword=%r  page=%d  URL: %s", keyword, page_num, url)
 
             if not await _navigate_safe(page, url):
+                if page_num == 1:
+                    errored = True  # 첫 페이지 진입 자체 실패 → 측정 불가
                 break
 
             # (1) networkidle 까지 더 길게 대기 — 2페이지 이후 비동기 로딩이 더 느림
@@ -738,6 +849,10 @@ async def _search_coupang(
 
             if not items:
                 log.warning("[Coupang] page %d: 재시도 후에도 0건 — 진단 로그 저장", page_num)
+                if await _looks_blocked(page):
+                    log.warning("[Coupang] page %d: 차단/캡차 페이지로 판단 — status=blocked",
+                                page_num)
+                    blocked = True
                 await _diagnose_page(page, "coupang", page_num)
                 break
 
@@ -765,19 +880,26 @@ async def _search_coupang(
                     found_rank, found_page = global_rank, page_num
 
             if found_rank and top5:
-                return found_rank, found_page, top5
+                return found_rank, found_page, top5, STATUS_OK
 
             await page.wait_for_timeout(random.randint(1_500, 2_500))
 
     except Exception as e:
         log.error("[Coupang] 처리되지 않은 예외: %s", e, exc_info=True)
+        errored = True
     finally:
         await page.close()
 
     if found_rank:
-        return found_rank, found_page, top5
+        return found_rank, found_page, top5, STATUS_OK
+    if errored:
+        log.info("[Coupang] target_id=%r — 스크래퍼 오류로 측정 실패", target_id)
+        return 0, None, top5, STATUS_ERROR
+    if blocked:
+        log.info("[Coupang] target_id=%r — 차단 페이지로 측정 실패", target_id)
+        return 0, None, top5, STATUS_BLOCKED
     log.info("[Coupang] target_id=%r — %d페이지 내 미발견", target_id, max_pages)
-    return 0, None, top5
+    return 0, None, top5, STATUS_NOT_FOUND
 
 
 # ---------------------------------------------------------------------------
@@ -805,9 +927,11 @@ async def get_rank(
         context = await _launch_persistent_context(pw, headless=headless, slow_mo=slow_mo)
         try:
             if platform == "naver":
-                rank, page_num, top5 = await _search_naver(context, keyword, target_id, max_pages)
+                rank, page_num, top5, status = await _search_naver(
+                    context, keyword, target_id, max_pages)
             else:
-                rank, page_num, top5 = await _search_coupang(context, keyword, target_id, max_pages)
+                rank, page_num, top5, status = await _search_coupang(
+                    context, keyword, target_id, max_pages)
         finally:
             await context.close()
 
@@ -818,6 +942,7 @@ async def get_rank(
         platform=platform,
         target_id=target_id,
         top5=top5,
+        status=status,
     )
 
 
@@ -848,11 +973,11 @@ async def get_all_ranks(
         results: list[RankResult] = []
         for item in items:
             if platform == "naver":
-                rank, pg, top5 = await _search_naver(
+                rank, pg, top5, status = await _search_naver(
                     ctx, item["keyword"], item["target_id"], max_pages
                 )
             else:
-                rank, pg, top5 = await _search_coupang(
+                rank, pg, top5, status = await _search_coupang(
                     ctx, item["keyword"], item["target_id"], max_pages
                 )
             results.append(
@@ -863,6 +988,7 @@ async def get_all_ranks(
                     platform=platform,
                     target_id=item["target_id"],
                     top5=top5,
+                    status=status,
                 )
             )
             await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -974,11 +1100,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"\n{'═'*55}")
-    if result.rank == 0:
-        print(f"  ❌ {pk} | {args.keyword!r} | ID {args.target_id}")
-        print(f"     → 미노출 ({args.pages}페이지 내 미발견)")
-        print(f"     → debug_screenshots/ 폴더의 스크린샷을 확인하세요.")
-    else:
+    if result.rank > 0:
         print(f"  ✅ {pk} | {args.keyword!r} | ID {args.target_id}")
         print(f"     → {result.rank}위  (검색결과 {result.page}페이지)")
+    elif result.status == STATUS_BLOCKED:
+        print(f"  ⛔ {pk} | {args.keyword!r} | ID {args.target_id}")
+        print(f"     → 차단/캡차 페이지 수신 — 순위 측정 불가 (status=blocked)")
+        print(f"     → auth_session 재인증(python auth_setup.py)을 검토하세요.")
+    elif result.status == STATUS_ERROR:
+        print(f"  ⚠️ {pk} | {args.keyword!r} | ID {args.target_id}")
+        print(f"     → 스크래퍼 오류 — 순위 측정 실패 (status=error)")
+        print(f"     → debug_screenshots/ 폴더의 스크린샷을 확인하세요.")
+    else:
+        print(f"  ❌ {pk} | {args.keyword!r} | ID {args.target_id}")
+        print(f"     → 미노출 ({args.pages}페이지 내 미발견, status=not_found)")
     print(f"{'═'*55}\n")

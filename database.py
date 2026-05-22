@@ -1,10 +1,22 @@
 """
 database.py — SQLite CRUD layer for the marketing automation dashboard.
 
-Tables:
-  products      — registered products with their platform, keyword, and target ID
-  rank_history  — daily rank snapshots per product
-  traffic_logs  — external traffic API call records per product
+Tables
+------
+  product_groups  — '품목'(상위 개념). 하위 상품 여러 개를 묶는 그룹.
+                    예) 품목 '에코앤팩 친환경 에어캡' → 하위 '에어캡 10mm', '에어캡 20mm'
+  products        — 등록 상품. 선택적으로 product_groups 에 소속(group_id).
+  rank_history    — 일자별 순위 스냅샷 + 스크래핑 상태(status)
+  competitor_ranks— 일자별 Top-N 경쟁사 스냅샷
+  traffic_logs    — 외부 트래픽 API 호출 기록
+
+스크래핑 상태(status)
+---------------------
+  ok        — 정상 추출 (rank > 0 또는 검색 후 미발견 0)
+  not_found — 검색은 됐으나 N페이지 내 미노출
+  blocked   — 차단/캡차 페이지 수신 (Access Denied 등) — 순위 신뢰 불가
+  error     — 스크래퍼 예외 — 순위 측정 자체 실패
+HTML 소스나 코드 블롭은 절대 DB 에 저장하지 않는다. 추출 실패는 status 로만 표현.
 """
 
 import re
@@ -22,6 +34,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rank scrape status constants — scraper / scheduler / dashboard 공통 규약
+# ---------------------------------------------------------------------------
+
+RANK_STATUS_OK        = "ok"
+RANK_STATUS_NOT_FOUND = "not_found"
+RANK_STATUS_BLOCKED   = "blocked"
+RANK_STATUS_ERROR     = "error"
+VALID_RANK_STATUSES   = {
+    RANK_STATUS_OK, RANK_STATUS_NOT_FOUND, RANK_STATUS_BLOCKED, RANK_STATUS_ERROR,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +72,18 @@ def get_conn(db_path: Path = DB_PATH):
 # Schema bootstrap
 # ---------------------------------------------------------------------------
 
+# '품목' — 하위 상품들을 묶는 상위 개념. 플랫폼 단위로 관리한다(상품 관리 UI 가
+# 네이버/쿠팡 섹션을 분리하므로 그룹도 플랫폼에 귀속시킨다).
+DDL_PRODUCT_GROUPS = """
+CREATE TABLE IF NOT EXISTS product_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    platform    TEXT    NOT NULL CHECK(platform IN ('naver', 'coupang')),
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(platform, name)
+);
+"""
+
 DDL_PRODUCTS = """
 CREATE TABLE IF NOT EXISTS products (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +92,7 @@ CREATE TABLE IF NOT EXISTS products (
     keyword     TEXT    NOT NULL,
     target_id   TEXT,               -- platform-specific product/vendor item ID
     target_url  TEXT,               -- fallback: direct product URL
+    group_id    INTEGER REFERENCES product_groups(id) ON DELETE SET NULL,
     active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -68,6 +105,7 @@ CREATE TABLE IF NOT EXISTS rank_history (
     rank_date   TEXT    NOT NULL,   -- ISO date: YYYY-MM-DD
     rank        INTEGER NOT NULL,   -- 0 = not found / not exposed
     page        INTEGER,            -- result page where the product was found
+    status      TEXT    NOT NULL DEFAULT 'ok',  -- ok | not_found | blocked | error
     crawled_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(product_id, rank_date)
 );
@@ -103,19 +141,79 @@ DDL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_rank_history_product_date ON rank_history(product_id, rank_date DESC);",
     "CREATE INDEX IF NOT EXISTS idx_traffic_logs_product      ON traffic_logs(product_id, requested_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_competitor_product_date   ON competitor_ranks(product_id, rank_date DESC, rank ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_products_group            ON products(group_id);",
 ]
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """기존 DB 에 새 컬럼을 점진적으로 추가한다 (idempotent).
+
+    오래된 marketing.db 에는 products.group_id / rank_history.status 컬럼이
+    없으므로 PRAGMA table_info 로 확인 후 ALTER TABLE 로 추가한다.
+    """
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
+    if "group_id" not in pcols:
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN group_id INTEGER "
+            "REFERENCES product_groups(id) ON DELETE SET NULL"
+        )
+        log.info("Migration: products.group_id 컬럼 추가")
+
+    rcols = {r["name"] for r in conn.execute("PRAGMA table_info(rank_history)").fetchall()}
+    if "status" not in rcols:
+        conn.execute(
+            "ALTER TABLE rank_history ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'"
+        )
+        log.info("Migration: rank_history.status 컬럼 추가")
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Create tables and indexes if they do not already exist."""
+    """Create tables and indexes if they do not already exist (+ run migrations)."""
     with get_conn(db_path) as conn:
+        # product_groups 를 먼저 만들어야 products 의 FK 가 유효하다.
+        conn.execute(DDL_PRODUCT_GROUPS)
         conn.execute(DDL_PRODUCTS)
         conn.execute(DDL_RANK_HISTORY)
         conn.execute(DDL_TRAFFIC_LOGS)
         conn.execute(DDL_COMPETITOR_RANKS)
+        _migrate(conn)
         for idx_sql in DDL_INDEXES:
             conn.execute(idx_sql)
     log.info("Database initialised at %s", db_path)
+
+
+# ---------------------------------------------------------------------------
+# 텍스트 정제 헬퍼 — 스크래핑 garbage(HTML 태그·코드 블롭)가 DB 에 들어가는 것을 방지
+# ---------------------------------------------------------------------------
+
+_TAG_RE   = re.compile(r"<[^>]*>")
+_WS_RE    = re.compile(r"\s+")
+_CODE_HINTS = ("function(", "function ", "var ", "{", "}", "</", "/>",
+               "window.", "document.", "=>", "();", "[]", "addeventlistener")
+
+
+def clean_text(raw: Optional[str], *, max_len: int = 120, fallback: str = "(이름미상)") -> str:
+    """스크래핑 텍스트를 안전한 한 줄 문자열로 정제한다.
+
+    - HTML 태그 제거, 공백 정규화
+    - 코드/스크립트 블롭으로 의심되면(중괄호·function 등 다수 포함) fallback 반환
+    - max_len 초과 시 잘라낸다
+    이렇게 해서 차단 페이지의 인라인 스크립트 텍스트가 상품명으로 저장되는
+    'HTML/코드 노출' 버그를 원천 차단한다.
+    """
+    if not raw:
+        return fallback
+    txt = _TAG_RE.sub(" ", str(raw))
+    txt = _WS_RE.sub(" ", txt).strip()
+    if not txt:
+        return fallback
+    low = txt.lower()
+    code_score = sum(low.count(h) for h in _CODE_HINTS)
+    if code_score >= 2:
+        return fallback
+    if len(txt) > max_len:
+        txt = txt[:max_len].rstrip() + "…"
+    return txt
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +255,102 @@ def extract_product_id(platform: str, url: str) -> Optional[str]:
     return None
 
 
+def _validate_platform(platform: str) -> str:
+    platform = (platform or "").lower()
+    if platform not in ("naver", "coupang"):
+        raise ValueError(f"platform must be 'naver' or 'coupang', got: {platform!r}")
+    return platform
+
+
+# ---------------------------------------------------------------------------
+# product_groups CRUD — '품목'(상위 개념)
+# ---------------------------------------------------------------------------
+
+def add_group(name: str, platform: str, db_path: Path = DB_PATH) -> int:
+    """새 품목을 생성하고 id 를 반환한다. 동일 (platform, name) 이 있으면 그 id 반환."""
+    platform = _validate_platform(platform)
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("group name must not be empty")
+    with get_conn(db_path) as conn:
+        existing = conn.execute(
+            "SELECT id FROM product_groups WHERE platform = ? AND name = ?",
+            (platform, name),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cur = conn.execute(
+            "INSERT INTO product_groups (name, platform) VALUES (?, ?)",
+            (name, platform),
+        )
+        new_id = cur.lastrowid
+    log.info("Product group added: id=%d  name=%r  platform=%s", new_id, name, platform)
+    return new_id
+
+
+# 등록 폼에서 '새 품목 추가' 시 동일 이름 그룹이 이미 있으면 재사용하도록 alias 제공
+get_or_create_group = add_group
+
+
+def get_group(group_id: int, db_path: Path = DB_PATH) -> Optional[sqlite3.Row]:
+    with get_conn(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM product_groups WHERE id = ?", (group_id,)
+        ).fetchone()
+
+
+def list_groups(
+    platform: Optional[str] = None,
+    db_path: Path = DB_PATH,
+) -> list[sqlite3.Row]:
+    """등록된 품목 목록 — 각 행에 product_count(소속 상품 수)를 포함한다."""
+    sql = """
+        SELECT g.*,
+               (SELECT COUNT(*) FROM products p WHERE p.group_id = g.id) AS product_count
+        FROM   product_groups g
+    """
+    params: list[object] = []
+    if platform is not None:
+        sql += " WHERE g.platform = ?"
+        params.append(_validate_platform(platform))
+    sql += " ORDER BY g.name"
+    with get_conn(db_path) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def rename_group(group_id: int, new_name: str, db_path: Path = DB_PATH) -> bool:
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return False
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE product_groups SET name = ? WHERE id = ?", (new_name, group_id)
+        )
+    return cur.rowcount > 0
+
+
+def delete_group(group_id: int, db_path: Path = DB_PATH) -> bool:
+    """품목을 삭제한다. 소속 상품의 group_id 는 NULL 로 풀린다(ON DELETE SET NULL)."""
+    with get_conn(db_path) as conn:
+        cur = conn.execute("DELETE FROM product_groups WHERE id = ?", (group_id,))
+    deleted = cur.rowcount > 0
+    if deleted:
+        log.info("Product group id=%d deleted.", group_id)
+    return deleted
+
+
+def prune_empty_groups(db_path: Path = DB_PATH) -> int:
+    """소속 상품이 0개인 품목을 정리한다 — 마지막 상품 삭제 후 호출하면 깔끔."""
+    with get_conn(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM product_groups "
+            "WHERE id NOT IN (SELECT DISTINCT group_id FROM products WHERE group_id IS NOT NULL)"
+        )
+    if cur.rowcount:
+        log.info("Pruned %d empty product group(s).", cur.rowcount)
+    return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # products CRUD
 # ---------------------------------------------------------------------------
@@ -167,27 +361,33 @@ def add_product(
     keyword: str,
     target_id: Optional[str] = None,
     target_url: Optional[str] = None,
+    group_id: Optional[int] = None,
     db_path: Path = DB_PATH,
 ) -> int:
     """Insert a new product and return its new id."""
-    platform = platform.lower()
-    if platform not in ("naver", "coupang"):
-        raise ValueError(f"platform must be 'naver' or 'coupang', got: {platform!r}")
+    platform = _validate_platform(platform)
     with get_conn(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO products (name, platform, keyword, target_id, target_url) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (name, platform, keyword, target_id, target_url),
+            "INSERT INTO products (name, platform, keyword, target_id, target_url, group_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (name, platform, keyword, target_id, target_url, group_id),
         )
         new_id = cur.lastrowid
-    log.info("Product added: id=%d  name=%r  platform=%s", new_id, name, platform)
+    log.info("Product added: id=%d  name=%r  platform=%s  group_id=%s",
+             new_id, name, platform, group_id)
     return new_id
 
 
 def get_product(product_id: int, db_path: Path = DB_PATH) -> Optional[sqlite3.Row]:
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM products WHERE id = ?", (product_id,)
+            """
+            SELECT p.*, g.name AS group_name
+            FROM   products p
+            LEFT   JOIN product_groups g ON p.group_id = g.id
+            WHERE  p.id = ?
+            """,
+            (product_id,),
         ).fetchone()
     return row
 
@@ -195,35 +395,37 @@ def get_product(product_id: int, db_path: Path = DB_PATH) -> Optional[sqlite3.Ro
 def list_products(
     active_only: bool = True,
     platform: Optional[str] = None,
+    group_id: Optional[int] = None,
     db_path: Path = DB_PATH,
 ) -> list[sqlite3.Row]:
     """
-    Return registered products.
+    Return registered products. 각 행에 group_name(품목명, 미분류면 NULL)을 포함한다.
 
     Parameters
     ----------
-    active_only : bool
-        True 면 active=1 인 행만 반환.
-    platform : Optional[str]
-        'naver' 또는 'coupang' 지정 시 해당 플랫폼만 필터링.
-        None 이면 모든 플랫폼.
+    active_only : bool       True 면 active=1 인 행만 반환.
+    platform    : str|None   'naver'/'coupang' 지정 시 해당 플랫폼만.
+    group_id    : int|None   지정 시 해당 품목 소속 상품만.
     """
-    sql = "SELECT * FROM products"
+    sql = """
+        SELECT p.*, g.name AS group_name
+        FROM   products p
+        LEFT   JOIN product_groups g ON p.group_id = g.id
+    """
     conditions: list[str] = []
     params: list[object] = []
     if active_only:
-        conditions.append("active = 1")
+        conditions.append("p.active = 1")
     if platform is not None:
-        platform = platform.lower()
-        if platform not in ("naver", "coupang"):
-            raise ValueError(
-                f"platform must be 'naver' or 'coupang', got: {platform!r}"
-            )
-        conditions.append("platform = ?")
-        params.append(platform)
+        conditions.append("p.platform = ?")
+        params.append(_validate_platform(platform))
+    if group_id is not None:
+        conditions.append("p.group_id = ?")
+        params.append(group_id)
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
-    sql += " ORDER BY platform, name"
+    # 품목 단위 계층 표시를 위해 그룹명 기준 정렬(미분류는 맨 뒤), 그 안에서 상품명순.
+    sql += " ORDER BY p.platform, (g.name IS NULL), g.name, p.name"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
     return rows
@@ -236,10 +438,15 @@ def update_product(
     keyword: Optional[str] = None,
     target_id: Optional[str] = None,
     target_url: Optional[str] = None,
+    group_id: Optional[int] = None,
+    clear_group: bool = False,
     active: Optional[bool] = None,
     db_path: Path = DB_PATH,
 ) -> bool:
-    """Partial update — only supplied fields are changed."""
+    """Partial update — only supplied fields are changed.
+
+    group_id 를 명시하면 해당 품목으로 이동. clear_group=True 면 품목 소속을 해제(NULL).
+    """
     fields: list[tuple[str, object]] = []
     if name is not None:
         fields.append(("name", name))
@@ -249,6 +456,10 @@ def update_product(
         fields.append(("target_id", target_id))
     if target_url is not None:
         fields.append(("target_url", target_url))
+    if clear_group:
+        fields.append(("group_id", None))
+    elif group_id is not None:
+        fields.append(("group_id", group_id))
     if active is not None:
         fields.append(("active", int(active)))
 
@@ -269,7 +480,7 @@ def update_product(
 
 
 def delete_product(product_id: int, db_path: Path = DB_PATH) -> bool:
-    """Hard-delete (cascades to rank_history and traffic_logs)."""
+    """Hard-delete (cascades to rank_history / competitor_ranks / traffic_logs)."""
     with get_conn(db_path) as conn:
         cur = conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
     deleted = cur.rowcount > 0
@@ -287,22 +498,31 @@ def upsert_rank(
     rank: int,
     rank_date: Optional[date] = None,
     page: Optional[int] = None,
+    status: str = RANK_STATUS_OK,
     db_path: Path = DB_PATH,
 ) -> None:
-    """Insert or replace today's rank for a product (one record per day)."""
+    """Insert or replace today's rank for a product (one record per day).
+
+    status 는 스크래핑 결과 상태(ok/not_found/blocked/error). 차단·오류 시에도
+    rank=0 으로 기록하되 status 로 구분해, 대시보드가 'HTML' 대신 상태 칩을 띄운다.
+    """
+    if status not in VALID_RANK_STATUSES:
+        status = RANK_STATUS_OK
     date_str = (rank_date or date.today()).isoformat()
     with get_conn(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO rank_history (product_id, rank_date, rank, page)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO rank_history (product_id, rank_date, rank, page, status)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(product_id, rank_date)
             DO UPDATE SET rank=excluded.rank, page=excluded.page,
+                          status=excluded.status,
                           crawled_at=datetime('now','localtime')
             """,
-            (product_id, date_str, rank, page),
+            (product_id, date_str, rank, page, status),
         )
-    log.info("Rank upserted: product_id=%d  date=%s  rank=%d", product_id, date_str, rank)
+    log.info("Rank upserted: product_id=%d  date=%s  rank=%d  status=%s",
+             product_id, date_str, rank, status)
 
 
 def get_rank_history(
@@ -314,7 +534,7 @@ def get_rank_history(
     with get_conn(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT rank_date, rank, page, crawled_at
+            SELECT rank_date, rank, page, status, crawled_at
             FROM   rank_history
             WHERE  product_id = ?
             ORDER  BY rank_date DESC
@@ -329,7 +549,7 @@ def get_latest_rank(product_id: int, db_path: Path = DB_PATH) -> Optional[sqlite
     with get_conn(db_path) as conn:
         row = conn.execute(
             """
-            SELECT rank_date, rank, page
+            SELECT rank_date, rank, page, status
             FROM   rank_history
             WHERE  product_id = ?
             ORDER  BY rank_date DESC
@@ -345,7 +565,7 @@ def get_rank_delta(product_id: int, db_path: Path = DB_PATH) -> Optional[int]:
     Return (yesterday_rank - today_rank).
     Positive  → rank improved (moved up).
     Negative  → rank worsened.
-    None      → insufficient history.
+    None      → insufficient history / 한쪽이 미노출·차단.
     """
     with get_conn(db_path) as conn:
         rows = conn.execute(
@@ -442,12 +662,14 @@ def upsert_competitor_ranks(
     하루치 Top-N 경쟁사 스냅샷을 저장한다.
 
     entries: [{"rank": int, "name": str, "target_id": Optional[str]}, ...]
-    같은 (product_id, rank_date) 의 기존 레코드는 모두 삭제 후 새로 삽입한다.
+    name 은 clean_text 로 정제 — 차단 페이지의 HTML/코드 텍스트가 경쟁사명으로
+    저장되지 않도록 방어한다. 같은 (product_id, rank_date) 의 기존 레코드는
+    모두 삭제 후 새로 삽입한다.
     """
     date_str = (rank_date or date.today()).isoformat()
     rows = [
-        (product_id, date_str, int(e["rank"]), str(e.get("name") or "(이름없음)"),
-         e.get("target_id"))
+        (product_id, date_str, int(e["rank"]),
+         clean_text(e.get("name"), max_len=100), e.get("target_id"))
         for e in entries
         if e.get("rank") is not None
     ]
@@ -492,68 +714,61 @@ def get_competitor_history(
 # Seed data helper
 # ---------------------------------------------------------------------------
 
-SAMPLE_PRODUCTS = [
-    {
-        "name": "친환경 에어캡",
-        "platform": "naver",
-        "keyword": "친환경 에어캡",
-        "target_id": "N_AIRCAP_001",
-        "target_url": None,
-    },
-    {
-        "name": "고체 치약",
-        "platform": "coupang",
-        "keyword": "고체 치약",
-        "target_id": "C_TOOTHPASTE_001",
-        "target_url": None,
-    },
-    {
-        "name": "천연 비누",
-        "platform": "naver",
-        "keyword": "천연 비누",
-        "target_id": "N_SOAP_001",
-        "target_url": None,
-    },
-    {
-        "name": "대나무 칫솔",
-        "platform": "coupang",
-        "keyword": "대나무 칫솔",
-        "target_id": "C_BAMBOOBRUSH_001",
-        "target_url": None,
-    },
-]
+# (그룹명, 상품명, 키워드, target_id) — 품목 계층을 보여주기 위한 샘플
+SAMPLE_GROUPS = {
+    "naver": [
+        ("에코앤팩 친환경 에어캡", [
+            ("에어캡 10mm",  "친환경 에어캡",   "N_AIRCAP_10"),
+            ("에어캡 20mm",  "친환경 에어캡 대형", "N_AIRCAP_20"),
+        ]),
+        ("내추럴 비누 라인", [
+            ("천연 비누",    "천연 비누",       "N_SOAP_001"),
+        ]),
+    ],
+    "coupang": [
+        ("덴탈케어 묶음", [
+            ("고체 치약",    "고체 치약",       "C_TOOTHPASTE_001"),
+            ("대나무 칫솔",  "대나무 칫솔",     "C_BAMBOOBRUSH_001"),
+        ]),
+    ],
+}
 
 
 def seed_sample_data(db_path: Path = DB_PATH) -> None:
-    """Insert sample products + dummy rank/traffic data for local testing."""
+    """Insert sample groups/products + dummy rank data for local testing."""
     existing = {row["name"] for row in list_products(active_only=False, db_path=db_path)}
 
     inserted_ids: list[int] = []
-    for p in SAMPLE_PRODUCTS:
-        if p["name"] in existing:
-            log.info("Sample product %r already exists, skipping.", p["name"])
-            continue
-        pid = add_product(
-            name=p["name"],
-            platform=p["platform"],
-            keyword=p["keyword"],
-            target_id=p["target_id"],
-            target_url=p["target_url"],
-            db_path=db_path,
-        )
-        inserted_ids.append(pid)
+    for platform, groups in SAMPLE_GROUPS.items():
+        for group_name, products in groups:
+            gid = add_group(group_name, platform, db_path=db_path)
+            for name, keyword, target_id in products:
+                if name in existing:
+                    log.info("Sample product %r already exists, skipping.", name)
+                    continue
+                pid = add_product(
+                    name=name,
+                    platform=platform,
+                    keyword=keyword,
+                    target_id=target_id,
+                    group_id=gid,
+                    db_path=db_path,
+                )
+                inserted_ids.append(pid)
 
     # Seed two days of rank history for newly inserted products
     from datetime import timedelta
     today = date.today()
     yesterday = today - timedelta(days=1)
 
-    sample_ranks = [8, 5, 34, 12]   # today
-    sample_ranks_yday = [10, 5, 29, 15]  # yesterday
+    sample_ranks      = [8, 22, 34, 5, 12]   # today
+    sample_ranks_yday = [10, 19, 29, 5, 15]  # yesterday
 
     for i, pid in enumerate(inserted_ids):
-        upsert_rank(pid, sample_ranks_yday[i], rank_date=yesterday, db_path=db_path)
-        upsert_rank(pid, sample_ranks[i], rank_date=today, db_path=db_path)
+        upsert_rank(pid, sample_ranks_yday[i % len(sample_ranks_yday)],
+                    rank_date=yesterday, db_path=db_path)
+        upsert_rank(pid, sample_ranks[i % len(sample_ranks)],
+                    rank_date=today, db_path=db_path)
         log_traffic(
             product_id=pid,
             traffic_qty=200,
@@ -586,21 +801,26 @@ if __name__ == "__main__":
     elif cmd == "list":
         init_db()
         products = list_products(active_only=False)
-        print(f"{'ID':<4} {'Platform':<10} {'Name':<20} {'Keyword':<20} {'TargetID'}")
-        print("-" * 75)
+        print(f"{'ID':<4} {'Platform':<10} {'Group':<22} {'Name':<18} {'Keyword':<18} {'TargetID'}")
+        print("-" * 95)
         for p in products:
             print(
-                f"{p['id']:<4} {p['platform']:<10} {p['name']:<20} "
-                f"{p['keyword']:<20} {p['target_id']}"
+                f"{p['id']:<4} {p['platform']:<10} {str(p['group_name'] or '(미분류)'):<22} "
+                f"{p['name']:<18} {p['keyword']:<18} {p['target_id']}"
             )
+
+    elif cmd == "groups":
+        init_db()
+        for g in list_groups():
+            print(f"[{g['id']}] {g['platform']:<8} {g['name']}  ({g['product_count']}개 상품)")
 
     elif cmd == "history":
         product_id = int(sys.argv[2])
         rows = get_rank_history(product_id)
         print(f"Rank history for product_id={product_id}:")
         for r in rows:
-            print(f"  {r['rank_date']}  rank={r['rank']}  page={r['page']}")
+            print(f"  {r['rank_date']}  rank={r['rank']}  page={r['page']}  status={r['status']}")
 
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: python database.py [init|seed|list|history <id>]")
+        print("Usage: python database.py [init|seed|list|groups|history <id>]")
