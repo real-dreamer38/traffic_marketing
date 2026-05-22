@@ -106,6 +106,19 @@ html, body, [class*="css"], [class*="st-"] {
 }
 .stApp { background: #ffffff !important; color: #0f172a; }
 
+/* CRITICAL: Streamlit Material 아이콘은 위 Inter 강제(!important)에서 반드시 제외한다.
+   아이콘 <span> 도 st-emotion-cache-* 클래스를 달고 있어 Inter 가 덮이면
+   아이콘 글리프 대신 ligature 텍스트('keyboard_arrow_down' 등)가 그대로
+   노출된다(아코디언 세모·사이드바 아이콘 깨짐). 아이콘 폰트를 재지정해 막는다. */
+span[data-testid="stIconMaterial"],
+[data-testid="stExpanderToggleIcon"],
+[data-testid="stIconMaterial"],
+.material-icons, .material-symbols-rounded, .material-symbols-outlined,
+[class*="material-symbols"], [class*="material-icons"] {
+    font-family: 'Material Symbols Rounded', 'Material Symbols Outlined',
+                 'Material Icons' !important;
+}
+
 #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; height: 0; }
 [data-testid="stMetricDeltaIcon-Up"],
 [data-testid="stMetricDeltaIcon-Down"] { display: none !important; }
@@ -448,6 +461,8 @@ def _delta_pill(delta: Optional[int], rank: int, status: str) -> str:
     """전일 대비 등락 Pill — +1 / -2 / 유지 / 신규 / 미노출."""
     if status in ("blocked", "error"):
         return '<span class="pill pill-slate">측정 불가</span>'
+    if status == "none":
+        return '<span class="pill pill-slate">데이터 없음</span>'
     if rank == 0:
         return '<span class="pill pill-slate">미노출</span>'
     if delta is None:
