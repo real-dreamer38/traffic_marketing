@@ -1,0 +1,18 @@
+# =============================================================
+#  Streamlit 설정 — 라이트 테마 강제
+#
+#  OS 다크모드나 브라우저/Streamlit 기본값과 무관하게, 대시보드가
+#  '어떤 환경에서도' 라이트 미니멀 톤(흰 배경)으로 열리도록 고정한다.
+#  base = "light" 가 다크 모드 렌더링을 차단하는 핵심 설정이다.
+# =============================================================
+
+[theme]
+base                    = "light"
+primaryColor            = "#4f46e5"
+backgroundColor         = "#ffffff"
+secondaryBackgroundColor = "#f8fafc"
+textColor               = "#0f172a"
+font                    = "sans serif"
+
+[server]
+headless = true

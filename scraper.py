@@ -116,6 +116,12 @@ COUPANG_ITEMS_PER_PAGE = 36
 
 DEFAULT_MAX_PAGES = 5
 
+# 차단(blocked) 항목 재시도 — 차단으로 끝난 상품을 쿨다운 후 다시 긁는다.
+# 네이버/쿠팡의 차단은 IP·세션 기준의 일시적 레이트리밋인 경우가 많아, 일정
+# 시간을 두고 재시도하면 일부가 회복된다. 끝까지 차단이면 status=blocked 확정.
+DEFAULT_BLOCK_RETRIES = 1                 # 재시도 라운드 수 (0 = 재시도 안 함)
+BLOCK_RETRY_COOLDOWN  = (90.0, 150.0)     # 라운드 간 쿨다운 범위 (초, 랜덤)
+
 # Product ID 추출 패턴 — href URL 과 data-* 속성에서 정규식으로 뽑음
 _NAVER_ID_PATTERNS = [
     re.compile(r'/catalog/(\d{8,})'),
@@ -913,25 +919,36 @@ async def get_rank(
     max_pages: int = DEFAULT_MAX_PAGES,
     headless: bool = True,
     slow_mo: int = 0,
+    block_retries: int = DEFAULT_BLOCK_RETRIES,
 ) -> RankResult:
     """
     Search `keyword` on `platform` and return the rank of `target_id`.
 
     auth_session 디렉터리(사용자가 미리 수동 인증해 둔 세션) 가 필요하다.
+    차단(blocked) 으로 끝나면 쿨다운 후 block_retries 회까지 재시도한다.
     """
     platform = platform.lower()
     if platform not in ("naver", "coupang"):
         raise ValueError(f"platform must be 'naver' or 'coupang', got: {platform!r}")
 
+    rank, page_num, top5, status = 0, None, [], STATUS_NOT_FOUND
     async with async_playwright() as pw:
         context = await _launch_persistent_context(pw, headless=headless, slow_mo=slow_mo)
         try:
-            if platform == "naver":
-                rank, page_num, top5, status = await _search_naver(
-                    context, keyword, target_id, max_pages)
-            else:
-                rank, page_num, top5, status = await _search_coupang(
-                    context, keyword, target_id, max_pages)
+            for attempt in range(block_retries + 1):   # 0 = 최초, 1.. = 재시도
+                if attempt > 0:
+                    cooldown = random.uniform(*BLOCK_RETRY_COOLDOWN)
+                    log.warning("[%s] 차단 — %.0fs 쿨다운 후 재시도 (%d/%d)",
+                                platform.upper(), cooldown, attempt, block_retries)
+                    await asyncio.sleep(cooldown)
+                if platform == "naver":
+                    rank, page_num, top5, status = await _search_naver(
+                        context, keyword, target_id, max_pages)
+                else:
+                    rank, page_num, top5, status = await _search_coupang(
+                        context, keyword, target_id, max_pages)
+                if status != STATUS_BLOCKED:
+                    break   # 차단이 아니면(성공·미노출·오류) 재시도 불필요
         finally:
             await context.close()
 
@@ -950,6 +967,7 @@ async def get_all_ranks(
     products: list[dict],
     max_pages: int = DEFAULT_MAX_PAGES,
     headless: bool = True,
+    block_retries: int = DEFAULT_BLOCK_RETRIES,
 ) -> list[RankResult]:
     """
     여러 상품의 순위를 한 번의 브라우저 세션으로 순차 처리.
@@ -970,29 +988,46 @@ async def get_all_ranks(
         platform: str,
         ctx: BrowserContext,
     ) -> list[RankResult]:
-        results: list[RankResult] = []
-        for item in items:
+        """플랫폼 상품을 순차 스크래핑. 차단된 항목은 쿨다운 후 재시도한다."""
+
+        async def _scrape_one(item: dict) -> RankResult:
             if platform == "naver":
                 rank, pg, top5, status = await _search_naver(
-                    ctx, item["keyword"], item["target_id"], max_pages
-                )
+                    ctx, item["keyword"], item["target_id"], max_pages)
             else:
                 rank, pg, top5, status = await _search_coupang(
-                    ctx, item["keyword"], item["target_id"], max_pages
-                )
-            results.append(
-                RankResult(
-                    rank=rank,
-                    page=pg,
-                    keyword=item["keyword"],
-                    platform=platform,
-                    target_id=item["target_id"],
-                    top5=top5,
-                    status=status,
-                )
+                    ctx, item["keyword"], item["target_id"], max_pages)
+            return RankResult(
+                rank=rank, page=pg, keyword=item["keyword"],
+                platform=platform, target_id=item["target_id"],
+                top5=top5, status=status,
             )
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-        return results
+
+        results: list[Optional[RankResult]] = [None] * len(items)
+        pending = list(range(len(items)))   # 아직 차단 미해소 인덱스
+
+        for attempt in range(block_retries + 1):   # 0 = 최초, 1.. = 재시도
+            if attempt > 0:
+                cooldown = random.uniform(*BLOCK_RETRY_COOLDOWN)
+                log.warning(
+                    "[%s] 차단 %d건 — %.0fs 쿨다운 후 재시도 (%d/%d)",
+                    platform, len(pending), cooldown, attempt, block_retries,
+                )
+                await asyncio.sleep(cooldown)
+
+            for idx in pending:
+                results[idx] = await _scrape_one(items[idx])
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
+            # 차단(blocked) 으로 끝난 항목만 다음 라운드 재시도 대상으로 남긴다.
+            pending = [i for i in pending if results[i].status == STATUS_BLOCKED]
+            if not pending:
+                break
+
+        if pending:
+            log.warning("[%s] 재시도 후에도 차단 %d건 — 차단 상태로 확정",
+                        platform, len(pending))
+        return [r for r in results if r is not None]
 
     async with async_playwright() as pw:
         context = await _launch_persistent_context(pw, headless=headless)
@@ -1059,6 +1094,8 @@ if __name__ == "__main__":
     parser.add_argument("target_id", help="타겟 상품 ID (예: 10839806076)")
     parser.add_argument("--pages",   type=int, default=DEFAULT_MAX_PAGES,
                         help=f"최대 탐색 페이지 수 (기본: {DEFAULT_MAX_PAGES})")
+    parser.add_argument("--block-retries", type=int, default=DEFAULT_BLOCK_RETRIES,
+                        help=f"차단 시 쿨다운 후 재시도 라운드 수 (기본: {DEFAULT_BLOCK_RETRIES})")
     parser.add_argument("--show",    action="store_true",
                         help="브라우저 창 표시 (headless=False, 로컬 PC 전용)")
     parser.add_argument("--debug",   action="store_true",
@@ -1087,12 +1124,13 @@ if __name__ == "__main__":
     try:
         result = asyncio.run(
             get_rank(
-                platform  = args.platform,
-                keyword   = args.keyword,
-                target_id = args.target_id,
-                max_pages = args.pages,
-                headless  = not args.show,
-                slow_mo   = 200 if args.show else 0,
+                platform      = args.platform,
+                keyword       = args.keyword,
+                target_id     = args.target_id,
+                max_pages     = args.pages,
+                headless      = not args.show,
+                slow_mo       = 200 if args.show else 0,
+                block_retries = args.block_retries,
             )
         )
     except AuthSessionMissingError as e:

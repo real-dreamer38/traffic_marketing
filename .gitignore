@@ -77,6 +77,11 @@ desktop.ini
 
 # ── Streamlit ───────────────────────────────────────────────
 .streamlit/secrets.toml
+# .streamlit/config.toml 은 추적함 (라이트 테마 고정 설정)
+
+# ── 스크래퍼 디버그 산출물 ──────────────────────────────────
+# 차단/추출 실패 시 진단용으로 저장되는 스크린샷 — 커밋 대상 아님
+debug_screenshots/
 
 # ── Playwright 다운로드 ─────────────────────────────────────
 playwright-report/

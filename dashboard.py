@@ -36,6 +36,7 @@ from typing import Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv(override=False)
@@ -98,13 +99,19 @@ PLATFORM_FORM_HINTS = {
 # Global CSS
 # ---------------------------------------------------------------------------
 
-CSS = """<style>
+CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 html, body, [class*="css"], [class*="st-"] {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
 }
 .stApp { background: #ffffff !important; color: #0f172a; }
+
+/* CSS 주입용 components.html iframe(height=0) 을 레이아웃에서 완전히 제거 */
+iframe[srcdoc] { display: none !important; height: 0 !important; }
+[data-testid="stElementContainer"]:has(iframe[srcdoc]) {
+    display: none !important; height: 0 !important; margin: 0 !important;
+}
 
 /* CRITICAL: Streamlit Material 아이콘은 위 Inter 강제(!important)에서 반드시 제외한다.
    아이콘 <span> 도 st-emotion-cache-* 클래스를 달고 있어 Inter 가 덮이면
@@ -368,9 +375,37 @@ hr { border-color: #e5e7eb !important; opacity: 1; margin: 1.4rem 0; }
     color: #991b1b; font-weight: 600;
 }
 .delete-dialog-warn { font-size: 0.85rem; color: #64748b; margin-bottom: 16px; line-height: 1.5; }
-</style>"""
+"""
 
-st.markdown(CSS, unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# CSS 주입 — components.html <script> 로 부모 문서 <head> 에 직접 삽입
+# ---------------------------------------------------------------------------
+# CSS 가 화면에 '텍스트'로 노출되는 사고를 원천 차단한다.
+#   · st.markdown(unsafe_allow_html=True): 프론트엔드 새니타이저가 <style> 을
+#     제거하면 CSS 본문(/* ... */ 주석 포함)이 그대로 글자로 노출됨 — 보고된 버그.
+#   · st.html(): 환경에 따라 <style> 이 적용되지 않음.
+# 아래 방식은 CSS 가 <script> 안의 문자열로만 존재 → 절대 텍스트로 렌더되지 않으며,
+# parent.document.head 에 <style> 엘리먼트를 직접 append → 항상 전역 적용된다.
+
+def _inject_css(css_body: str) -> None:
+    safe = (css_body.replace("\\", "\\\\")
+                    .replace("`", "\\`")
+                    .replace("${", "\\${"))
+    components.html(
+        "<script>(function(){"
+        "  var d = window.parent.document;"
+        "  var prev = d.getElementById('dashboard-custom-css');"
+        "  if (prev) prev.remove();"
+        "  var s = d.createElement('style');"
+        "  s.id = 'dashboard-custom-css';"
+        f"  s.textContent = `{safe}`;"
+        "  d.head.appendChild(s);"
+        "})();</script>",
+        height=0,
+    )
+
+
+_inject_css(CSS)
 
 
 # ---------------------------------------------------------------------------

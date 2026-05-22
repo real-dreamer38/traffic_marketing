@@ -291,11 +291,11 @@ def build_platform_message(platform: str, items: list[ReportItem]) -> str:
         ━━━━━━━━━━━━━━━━━━
 
         📦 에코앤팩 친환경 에어캡
-          • 에어캡 10mm — 8위  🔺 2
-          • 에어캡 20mm — 22위  🔻 3
+          • 에어캡 10mm [친환경 에어캡] — 8위  🔺 2
+          • 에어캡 20mm [친환경 에어캡 대형] — 22위  🔻 3
 
         📦 (미분류)
-          • 천연 비누 — 미노출
+          • 천연 비누 [천연 비누] — 미노출
 
         ━━━━━━━━━━━━━━━━━━
         📊 노출 2/3 · 🔺 1 · 🔻 1
@@ -322,8 +322,13 @@ def build_platform_message(platform: str, items: list[ReportItem]) -> str:
     for gname, g_items in grouped.items():
         lines.append(f"📦 <b>{html.escape(gname)}</b>")
         for it in g_items:
+            # '• 상품명 [검색키워드] — 순위/상태' — 어떤 키워드가 몇 위/차단인지
+            # 한눈에 보이도록 키워드를 <code> 칩으로 명시한다.
             name_esc = html.escape(it.name)
-            lines.append(f"  • {name_esc} — {_fmt_status_cell(it)}")
+            kw_esc   = html.escape(it.keyword)
+            lines.append(
+                f"  • <b>{name_esc}</b> <code>[{kw_esc}]</code> — {_fmt_status_cell(it)}"
+            )
         lines.append("")
 
     lines.append(SECTION_DIVIDER)
@@ -487,7 +492,7 @@ def _log_report_to_console(items: list[ReportItem]) -> None:
                 arrow = "신규" if it.yesterday_rank is None else (
                     f"▲{d}" if d and d > 0 else f"▼{abs(d)}" if d and d < 0 else "유지")
                 state = f"{it.today_rank}위 ({arrow})"
-            print(f"     - {it.name}: {state}")
+            print(f"     - {it.name} [{it.keyword}]: {state}")
     print("-" * 56)
 
 
