@@ -100,13 +100,15 @@ CREATE TABLE IF NOT EXISTS products (
 
 DDL_RANK_HISTORY = """
 CREATE TABLE IF NOT EXISTS rank_history (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    rank_date   TEXT    NOT NULL,   -- ISO date: YYYY-MM-DD
-    rank        INTEGER NOT NULL,   -- 0 = not found / not exposed
-    page        INTEGER,            -- result page where the product was found
-    status      TEXT    NOT NULL DEFAULT 'ok',  -- ok | not_found | blocked | error
-    crawled_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    rank_date     TEXT    NOT NULL,   -- ISO date: YYYY-MM-DD
+    rank          INTEGER NOT NULL,   -- 0 = not found / not exposed
+    page          INTEGER,            -- result page where the product was found
+    status        TEXT    NOT NULL DEFAULT 'ok',  -- ok | not_found | blocked | error
+    price         INTEGER,            -- 내 상품 노출가 (원) — 경쟁 분석용
+    review_count  INTEGER,            -- 내 상품 리뷰 수 — 경쟁 분석용
+    crawled_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(product_id, rank_date)
 );
 """
@@ -123,16 +125,21 @@ CREATE TABLE IF NOT EXISTS traffic_logs (
 );
 """
 
-# 동일 키워드 검색결과의 1~5위 경쟁사를 일자별로 저장
+# 동일 키워드 검색결과의 1~5위 경쟁사를 일자별로 저장.
+# AI 경쟁 분석을 위해 가격·리뷰수·평점·썸네일 보유 여부까지 함께 수집한다.
 DDL_COMPETITOR_RANKS = """
 CREATE TABLE IF NOT EXISTS competitor_ranks (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    rank_date   TEXT    NOT NULL,
-    rank        INTEGER NOT NULL,           -- 1..5
-    name        TEXT    NOT NULL,
-    target_id   TEXT,
-    crawled_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    rank_date     TEXT    NOT NULL,
+    rank          INTEGER NOT NULL,         -- 1..5
+    name          TEXT    NOT NULL,
+    target_id     TEXT,
+    price         INTEGER,                  -- 경쟁사 노출가 (원)
+    review_count  INTEGER,                  -- 경쟁사 리뷰 수
+    rating        REAL,                     -- 경쟁사 평점 (0~5)
+    has_thumbnail INTEGER,                  -- 1 = 썸네일 이미지 보유
+    crawled_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(product_id, rank_date, rank)
 );
 """
@@ -165,6 +172,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE rank_history ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'"
         )
         log.info("Migration: rank_history.status 컬럼 추가")
+    if "price" not in rcols:
+        conn.execute("ALTER TABLE rank_history ADD COLUMN price INTEGER")
+        log.info("Migration: rank_history.price 컬럼 추가")
+    if "review_count" not in rcols:
+        conn.execute("ALTER TABLE rank_history ADD COLUMN review_count INTEGER")
+        log.info("Migration: rank_history.review_count 컬럼 추가")
+
+    # competitor_ranks — 경쟁사 가격/리뷰/평점/썸네일 지표 컬럼
+    ccols = {r["name"] for r in conn.execute("PRAGMA table_info(competitor_ranks)").fetchall()}
+    for col, decl in (("price", "INTEGER"), ("review_count", "INTEGER"),
+                      ("rating", "REAL"), ("has_thumbnail", "INTEGER")):
+        if col not in ccols:
+            conn.execute(f"ALTER TABLE competitor_ranks ADD COLUMN {col} {decl}")
+            log.info("Migration: competitor_ranks.%s 컬럼 추가", col)
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -499,12 +520,15 @@ def upsert_rank(
     rank_date: Optional[date] = None,
     page: Optional[int] = None,
     status: str = RANK_STATUS_OK,
+    price: Optional[int] = None,
+    review_count: Optional[int] = None,
     db_path: Path = DB_PATH,
 ) -> None:
     """Insert or replace today's rank for a product (one record per day).
 
     status 는 스크래핑 결과 상태(ok/not_found/blocked/error). 차단·오류 시에도
     rank=0 으로 기록하되 status 로 구분해, 대시보드가 'HTML' 대신 상태 칩을 띄운다.
+    price / review_count 는 내 상품의 노출가·리뷰수(경쟁 분석용, 없으면 NULL).
     """
     if status not in VALID_RANK_STATUSES:
         status = RANK_STATUS_OK
@@ -512,14 +536,18 @@ def upsert_rank(
     with get_conn(db_path) as conn:
         conn.execute(
             """
-            INSERT INTO rank_history (product_id, rank_date, rank, page, status)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO rank_history
+                (product_id, rank_date, rank, page, status, price, review_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(product_id, rank_date)
             DO UPDATE SET rank=excluded.rank, page=excluded.page,
                           status=excluded.status,
+                          price=COALESCE(excluded.price, rank_history.price),
+                          review_count=COALESCE(excluded.review_count,
+                                                rank_history.review_count),
                           crawled_at=datetime('now','localtime')
             """,
-            (product_id, date_str, rank, page, status),
+            (product_id, date_str, rank, page, status, price, review_count),
         )
     log.info("Rank upserted: product_id=%d  date=%s  rank=%d  status=%s",
              product_id, date_str, rank, status)
@@ -534,7 +562,7 @@ def get_rank_history(
     with get_conn(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT rank_date, rank, page, status, crawled_at
+            SELECT rank_date, rank, page, status, price, review_count, crawled_at
             FROM   rank_history
             WHERE  product_id = ?
             ORDER  BY rank_date DESC
@@ -549,7 +577,7 @@ def get_latest_rank(product_id: int, db_path: Path = DB_PATH) -> Optional[sqlite
     with get_conn(db_path) as conn:
         row = conn.execute(
             """
-            SELECT rank_date, rank, page, status
+            SELECT rank_date, rank, page, status, price, review_count
             FROM   rank_history
             WHERE  product_id = ?
             ORDER  BY rank_date DESC
@@ -652,6 +680,25 @@ def get_total_traffic_qty(product_id: int, db_path: Path = DB_PATH) -> int:
 # competitor_ranks CRUD
 # ---------------------------------------------------------------------------
 
+def _safe_int(val) -> Optional[int]:
+    """문자열/숫자에서 정수를 안전하게 뽑는다 ('18,000원' → 18000). 실패 시 None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    digits = re.sub(r"[^\d]", "", str(val))
+    return int(digits) if digits else None
+
+
+def _safe_float(val) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(str(val).strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def upsert_competitor_ranks(
     product_id: int,
     entries: list[dict],
@@ -659,17 +706,24 @@ def upsert_competitor_ranks(
     db_path: Path = DB_PATH,
 ) -> None:
     """
-    하루치 Top-N 경쟁사 스냅샷을 저장한다.
+    하루치 Top-N 경쟁사 스냅샷을 저장한다 (가격·리뷰·평점·썸네일 포함).
 
-    entries: [{"rank": int, "name": str, "target_id": Optional[str]}, ...]
+    entries: [{"rank": int, "name": str, "target_id": str,
+               "price": int|None, "review_count": int|None,
+               "rating": float|None, "has_thumbnail": bool|None}, ...]
     name 은 clean_text 로 정제 — 차단 페이지의 HTML/코드 텍스트가 경쟁사명으로
     저장되지 않도록 방어한다. 같은 (product_id, rank_date) 의 기존 레코드는
     모두 삭제 후 새로 삽입한다.
     """
     date_str = (rank_date or date.today()).isoformat()
     rows = [
-        (product_id, date_str, int(e["rank"]),
-         clean_text(e.get("name"), max_len=100), e.get("target_id"))
+        (
+            product_id, date_str, int(e["rank"]),
+            clean_text(e.get("name"), max_len=100), e.get("target_id"),
+            _safe_int(e.get("price")), _safe_int(e.get("review_count")),
+            _safe_float(e.get("rating")),
+            (1 if e.get("has_thumbnail") else 0) if e.get("has_thumbnail") is not None else None,
+        )
         for e in entries
         if e.get("rank") is not None
     ]
@@ -680,8 +734,10 @@ def upsert_competitor_ranks(
         )
         if rows:
             conn.executemany(
-                "INSERT INTO competitor_ranks (product_id, rank_date, rank, name, target_id) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO competitor_ranks "
+                "(product_id, rank_date, rank, name, target_id, "
+                " price, review_count, rating, has_thumbnail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
     log.info("Competitor ranks upserted: product_id=%d  date=%s  count=%d",
@@ -699,13 +755,42 @@ def get_competitor_history(
     with get_conn(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT rank_date, rank, name, target_id
+            SELECT rank_date, rank, name, target_id,
+                   price, review_count, rating, has_thumbnail
             FROM   competitor_ranks
             WHERE  product_id = ?
               AND  rank_date >= date('now', ?)
             ORDER  BY rank_date ASC, rank ASC
             """,
             (product_id, f"-{int(days)} days"),
+        ).fetchall()
+    return rows
+
+
+def get_latest_competitors(
+    product_id: int,
+    db_path: Path = DB_PATH,
+) -> list[sqlite3.Row]:
+    """
+    가장 최근 일자의 Top-N 경쟁사 스냅샷(가격·리뷰·평점·썸네일 포함)을 반환.
+    AI 경쟁 분석과 대시보드 비교 테이블에서 사용한다.
+    """
+    with get_conn(db_path) as conn:
+        latest = conn.execute(
+            "SELECT MAX(rank_date) AS d FROM competitor_ranks WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()
+        if not latest or not latest["d"]:
+            return []
+        rows = conn.execute(
+            """
+            SELECT rank_date, rank, name, target_id,
+                   price, review_count, rating, has_thumbnail
+            FROM   competitor_ranks
+            WHERE  product_id = ? AND rank_date = ?
+            ORDER  BY rank ASC
+            """,
+            (product_id, latest["d"]),
         ).fetchall()
     return rows
 
@@ -734,8 +819,26 @@ SAMPLE_GROUPS = {
 }
 
 
+def _sample_competitors(seed: int) -> list[dict]:
+    """샘플 Top5 경쟁사 — 가격/리뷰/평점/썸네일 포함 (AI 비교 분석 시연용)."""
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    out = []
+    for r in range(1, 6):
+        out.append({
+            "rank": r,
+            "name": f"경쟁사 상품 {r}",
+            "target_id": f"COMP_{seed}_{r}",
+            "price": rng.choice([12900, 13900, 14900, 15900, 16900]),
+            "review_count": rng.choice([320, 580, 1240, 2100, 4300]),
+            "rating": round(rng.uniform(4.4, 4.9), 1),
+            "has_thumbnail": True,
+        })
+    return out
+
+
 def seed_sample_data(db_path: Path = DB_PATH) -> None:
-    """Insert sample groups/products + dummy rank data for local testing."""
+    """Insert sample groups/products + dummy rank/competitor data for local testing."""
     existing = {row["name"] for row in list_products(active_only=False, db_path=db_path)}
 
     inserted_ids: list[int] = []
@@ -756,19 +859,26 @@ def seed_sample_data(db_path: Path = DB_PATH) -> None:
                 )
                 inserted_ids.append(pid)
 
-    # Seed two days of rank history for newly inserted products
+    # Seed two days of rank history + 경쟁사 스냅샷 for newly inserted products
     from datetime import timedelta
     today = date.today()
     yesterday = today - timedelta(days=1)
 
     sample_ranks      = [8, 22, 34, 5, 12]   # today
     sample_ranks_yday = [10, 19, 29, 5, 15]  # yesterday
+    sample_prices     = [18000, 21000, 9900, 14500, 17900]   # 내 상품 노출가
+    sample_reviews    = [340, 120, 890, 2400, 510]           # 내 상품 리뷰 수
 
     for i, pid in enumerate(inserted_ids):
         upsert_rank(pid, sample_ranks_yday[i % len(sample_ranks_yday)],
                     rank_date=yesterday, db_path=db_path)
         upsert_rank(pid, sample_ranks[i % len(sample_ranks)],
-                    rank_date=today, db_path=db_path)
+                    rank_date=today,
+                    price=sample_prices[i % len(sample_prices)],
+                    review_count=sample_reviews[i % len(sample_reviews)],
+                    db_path=db_path)
+        upsert_competitor_ranks(pid, _sample_competitors(seed=pid),
+                                rank_date=today, db_path=db_path)
         log_traffic(
             product_id=pid,
             traffic_qty=200,

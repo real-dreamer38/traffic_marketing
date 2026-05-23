@@ -121,6 +121,8 @@ def _build_report_item(
     status:        str = "ok",
     scrape_error:  Optional[str] = None,
     persist_today: bool = True,
+    my_price:      Optional[int] = None,
+    my_review_count: Optional[int] = None,
     db_path=None,
 ) -> ReportItem:
     if db_path is None:
@@ -130,7 +132,7 @@ def _build_report_item(
 
     # 배치 전체가 크래시한 경우(scrape_error)에는 측정값이 없어 저장하지 않는다.
     # 그 외에는 ok/not_found/blocked/error 상태를 그대로 저장 — HTML 이 아니라
-    # '상태값'으로 명확히 기록한다.
+    # '상태값'으로 명확히 기록한다. 내 상품 가격·리뷰수도 함께 저장(경쟁 분석용).
     if persist_today and scrape_error is None:
         db.upsert_rank(
             product_id=pid,
@@ -138,6 +140,8 @@ def _build_report_item(
             rank_date=date.today(),
             page=today_page,
             status=status,
+            price=my_price,
+            review_count=my_review_count,
             db_path=db_path,
         )
 
@@ -208,16 +212,18 @@ async def _run_scrape_and_save() -> list[ReportItem]:
         status     = result.status if result else "error"
         report_items.append(
             _build_report_item(
-                product       = p,
-                today_rank    = today_rank,
-                today_page    = today_page,
-                status        = status,
-                scrape_error  = None,
-                persist_today = True,
+                product         = p,
+                today_rank      = today_rank,
+                today_page      = today_page,
+                status          = status,
+                scrape_error    = None,
+                persist_today   = True,
+                my_price        = result.my_price if result else None,
+                my_review_count = result.my_review_count if result else None,
             )
         )
 
-        # 경쟁사 Top5 는 정상/미노출 상태에서만 신뢰 — 차단·오류 시엔 저장하지 않는다.
+        # 경쟁사 Top5(가격·리뷰 포함)는 정상/미노출 상태에서만 신뢰 — 차단·오류 시 저장 안 함.
         if result and result.top5 and result.status in ("ok", "not_found"):
             try:
                 db.upsert_competitor_ranks(

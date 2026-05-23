@@ -181,8 +181,11 @@ class RankResult:
     keyword: str
     platform: str
     target_id: str
-    top5: list[dict] = None  # [{"rank": int, "name": str, "target_id": str}], page1 기준 Top 5
+    top5: list[dict] = None  # Top5 경쟁사 — [{"rank","name","target_id","price",
+                             #               "review_count","rating","has_thumbnail"}]
     status: str = STATUS_OK  # ok | not_found | blocked | error
+    my_price: Optional[int] = None         # 내 상품 노출가 (검색결과에서 추출)
+    my_review_count: Optional[int] = None  # 내 상품 리뷰 수
 
     def __post_init__(self):
         if self.top5 is None:
@@ -456,30 +459,59 @@ async def _extract_naver_items(page: Page) -> list[dict]:
                         );
                 }
 
-                const findTitle = (anchor) => {
-                    // 1) 카드 컨테이너 위쪽에서 제목 후보 셀렉터 탐색
-                    const card =
-                        anchor.closest('li[class*="product"]') ||
-                        anchor.closest('div[class*="product"]') ||
-                        anchor.closest('li') ||
-                        anchor.parentElement;
-                    if (card) {
-                        const titleEl =
-                            card.querySelector('[class*="product_title"]') ||
-                            card.querySelector('[class*="productTitle"]')  ||
-                            card.querySelector('[class*="title"]')         ||
-                            card.querySelector('[class*="name"]')          ||
-                            card.querySelector('strong');
-                        if (titleEl && titleEl.textContent) {
-                            return titleEl.textContent.trim();
-                        }
-                    }
-                    // 2) anchor 자체 텍스트 폴백
-                    const txt = (anchor.textContent || '').trim();
-                    return txt;
+                // 숫자만 추출 ('18,000원' → 18000)
+                const digits = (s) => {
+                    if (!s) return null;
+                    const m = String(s).replace(/[^0-9]/g, '');
+                    return m ? parseInt(m, 10) : null;
                 };
+                // 후보 셀렉터를 순차 시도해 첫 텍스트를 반환
+                const pickText = (card, sels) => {
+                    for (const s of sels) {
+                        const e = card.querySelector(s);
+                        if (e && e.textContent && e.textContent.trim())
+                            return e.textContent.trim();
+                    }
+                    return '';
+                };
+                const cardOf = (a) =>
+                    a.closest('li[class*="product"]')  ||
+                    a.closest('div[class*="product"]') ||
+                    a.closest('li[class*="item"]')     ||
+                    a.closest('li') || a.parentElement || document.body;
 
-                return anchors.map(a => ({ href: a.href, name: findTitle(a) }));
+                return anchors.map(a => {
+                    const card = cardOf(a);
+                    const name = pickText(card, [
+                        '[class*="product_title"]', '[class*="productTitle"]',
+                        '[class*="basicList_title"]', '[class*="title"]',
+                        '[class*="name"]', 'strong',
+                    ]) || (a.textContent || '').trim();
+                    const priceTxt = pickText(card, [
+                        '[class*="price_num"]', '[class*="priceNum"]',
+                        '[class*="price"]', 'strong[class*="num"]',
+                    ]);
+                    const reviewTxt = pickText(card, [
+                        '[class*="review"]', '[class*="Review"]',
+                    ]);
+                    const ratingTxt = pickText(card, [
+                        '[class*="grade"]', '[class*="star"]',
+                    ]);
+                    const img = card.querySelector('img');
+                    const thumb = !!(img && img.src &&
+                        img.src.indexOf('http') === 0 &&
+                        img.src.indexOf('blank') === -1);
+                    let rating = null;
+                    if (ratingTxt) {
+                        const rf = parseFloat(ratingTxt.replace(/[^0-9.]/g, ''));
+                        if (!isNaN(rf) && rf > 0 && rf <= 5) rating = rf;
+                    }
+                    return {
+                        href: a.href, name: name,
+                        price: digits(priceTxt), reviews: digits(reviewTxt),
+                        rating: rating, thumb: thumb,
+                    };
+                });
             }
         """)
         log.debug("[Naver] JS raw anchors count: %d", len(raw))
@@ -489,7 +521,11 @@ async def _extract_naver_items(page: Page) -> list[dict]:
             for pat in _NAVER_ID_PATTERNS:
                 m = pat.search(href)
                 if m:
-                    items.append({"id": m.group(1), "name": name})
+                    items.append({
+                        "id": m.group(1), "name": name,
+                        "price": entry.get("price"), "reviews": entry.get("reviews"),
+                        "rating": entry.get("rating"), "thumb": entry.get("thumb"),
+                    })
                     break
         items = _dedupe_items(items)
         if items:
@@ -553,33 +589,65 @@ async def _extract_coupang_items(page: Page) -> list[dict]:
                 }
                 if (!listEl) listEl = document.body;
 
-                const findName = (el) => {
-                    const titleEl =
-                        el.querySelector('[class*="name"]')        ||
-                        el.querySelector('[class*="title"]')       ||
-                        el.querySelector('[class*="productName"]') ||
-                        el.querySelector('div.name')               ||
-                        el.querySelector('strong')                 ||
-                        el.querySelector('a');
-                    return (titleEl && titleEl.textContent) ? titleEl.textContent.trim() : '';
+                const digits = (s) => {
+                    if (!s) return null;
+                    const m = String(s).replace(/[^0-9]/g, '');
+                    return m ? parseInt(m, 10) : null;
+                };
+                const pickText = (card, sels) => {
+                    for (const s of sels) {
+                        const e = card.querySelector(s);
+                        if (e && e.textContent && e.textContent.trim())
+                            return e.textContent.trim();
+                    }
+                    return '';
+                };
+                // 카드 한 개에서 이름·가격·리뷰·평점·썸네일을 추출
+                const extract = (card) => {
+                    const name = pickText(card, [
+                        '[class*="name"]', '[class*="title"]',
+                        '[class*="productName"]', 'div.name', 'strong', 'a',
+                    ]);
+                    const priceTxt = pickText(card, [
+                        '[class*="price-value"]', '[class*="priceValue"]',
+                        'strong[class*="price"]', '[class*="price"]',
+                    ]);
+                    const reviewTxt = pickText(card, [
+                        '[class*="rating-total"]', '[class*="ratingTotal"]',
+                        '[class*="review"]',
+                    ]);
+                    const ratingTxt = pickText(card, [
+                        '[class*="star"]',
+                    ]);
+                    const img = card.querySelector('img');
+                    const thumb = !!(img && (img.src ||
+                        img.getAttribute('data-img-src') ||
+                        img.getAttribute('data-src')));
+                    let rating = null;
+                    if (ratingTxt) {
+                        const rf = parseFloat(ratingTxt.replace(/[^0-9.]/g, ''));
+                        if (!isNaN(rf) && rf > 0 && rf <= 5) rating = rf;
+                    }
+                    return {
+                        name: name, price: digits(priceTxt),
+                        reviews: digits(reviewTxt), rating: rating, thumb: thumb,
+                    };
                 };
 
                 // 1) data-product-id 속성 보유 컨테이너
                 let nodes = Array.from(listEl.querySelectorAll('[data-product-id]'));
                 if (nodes.length) {
-                    return nodes.map(el => ({
-                        id: el.getAttribute('data-product-id') || '',
-                        name: findName(el),
-                    })).filter(x => x.id);
+                    return nodes.map(el => Object.assign(
+                        { id: el.getAttribute('data-product-id') || '' }, extract(el)
+                    )).filter(x => x.id);
                 }
 
                 // 2) data-vendor-item-id 폴백
                 nodes = Array.from(listEl.querySelectorAll('[data-vendor-item-id]'));
                 if (nodes.length) {
-                    return nodes.map(el => ({
-                        id: el.getAttribute('data-vendor-item-id') || '',
-                        name: findName(el),
-                    })).filter(x => x.id);
+                    return nodes.map(el => Object.assign(
+                        { id: el.getAttribute('data-vendor-item-id') || '' }, extract(el)
+                    )).filter(x => x.id);
                 }
 
                 // 3) /vp/products/<id> 링크 — DOM 순서 그대로 수집
@@ -588,11 +656,8 @@ async def _extract_coupang_items(page: Page) -> list[dict]:
                 ).map(a => {
                     const m = a.href.match(/\\/vp\\/products\\/(\\d+)/);
                     if (!m) return null;
-                    const card = a.closest('li') || a.parentElement;
-                    return {
-                        id: m[1],
-                        name: card ? findName(card) : (a.textContent || '').trim(),
-                    };
+                    const card = a.closest('li') || a.parentElement || document.body;
+                    return Object.assign({ id: m[1] }, extract(card));
                 }).filter(Boolean);
             }
         """)
@@ -601,7 +666,11 @@ async def _extract_coupang_items(page: Page) -> list[dict]:
             pid = (entry.get("id") or "").strip()
             if not pid:
                 continue
-            items.append({"id": pid, "name": _sanitize_name(entry.get("name"))})
+            items.append({
+                "id": pid, "name": _sanitize_name(entry.get("name")),
+                "price": entry.get("price"), "reviews": entry.get("reviews"),
+                "rating": entry.get("rating"), "thumb": entry.get("thumb"),
+            })
         items = _dedupe_items(items)
         if items:
             log.debug("[Coupang] JS strategy: %d items — sample: %s",
@@ -674,24 +743,46 @@ async def _diagnose_page(page: Page, platform: str, page_num: int) -> None:
         log.debug("진단 중 오류: %s", e)
 
 
+def _build_top5(items: list[dict]) -> list[dict]:
+    """검색결과 앞 5개를 경쟁사 스냅샷 dict 리스트로 변환 (가격·리뷰·평점·썸네일 포함)."""
+    return [
+        {
+            "rank":          idx + 1,
+            "name":          it.get("name") or "(이름없음)",
+            "target_id":     it.get("id") or "",
+            "price":         it.get("price"),
+            "review_count":  it.get("reviews"),
+            "rating":        it.get("rating"),
+            "has_thumbnail": it.get("thumb"),
+        }
+        for idx, it in enumerate(items[:5])
+    ]
+
+
 async def _search_naver(
     context: BrowserContext,
     keyword: str,
     target_id: str,
     max_pages: int,
-) -> tuple[int, Optional[int], list[dict], str]:
+) -> RankResult:
     """
-    Returns (rank, page_num, top5, status).
-    top5  : [{"rank": int, "name": str, "target_id": str}] — 1페이지 첫 5개 (실패 시 [])
-    status: ok | not_found | blocked | error
+    네이버 쇼핑에서 keyword 를 검색해 target_id 의 순위와 Top5 경쟁사 지표를
+    담은 RankResult 를 반환한다. status: ok | not_found | blocked | error.
     """
     page = await context.new_page()
     global_rank = 0
     top5: list[dict] = []
     found_rank: int = 0
     found_page: Optional[int] = None
+    my_price: Optional[int] = None
+    my_reviews: Optional[int] = None
     blocked: bool = False
     errored: bool = False
+
+    def _result(rank: int, pg: Optional[int], status: str) -> RankResult:
+        return RankResult(rank=rank, page=pg, keyword=keyword, platform="naver",
+                          target_id=target_id, top5=top5, status=status,
+                          my_price=my_price, my_review_count=my_reviews)
 
     # 쿠키 워밍 — auth_session 의 쿠키가 갱신되도록 메인 먼저 방문
     await _warm_up(page, "https://shopping.naver.com/")
@@ -738,17 +829,11 @@ async def _search_naver(
                 await _diagnose_page(page, "naver", page_num)
                 break
 
-            # 1페이지 첫 5개를 경쟁사 스냅샷으로 저장
+            # 1페이지 첫 5개를 경쟁사 스냅샷(가격·리뷰 포함)으로 저장
             if page_num == 1 and not top5:
-                top5 = [
-                    {
-                        "rank": idx + 1,
-                        "name": it.get("name") or "(이름없음)",
-                        "target_id": it.get("id") or "",
-                    }
-                    for idx, it in enumerate(items[:5])
-                ]
-                log.info("[Naver] Top5 수집: %s", [(t["rank"], t["name"][:20]) for t in top5])
+                top5 = _build_top5(items)
+                log.info("[Naver] Top5 수집: %s",
+                         [(t["rank"], t["name"][:14], t["price"]) for t in top5])
 
             log.info("[Naver] page %d: %d개 상품 추출 — 앞 5개: %s",
                      page_num, len(items), [i["id"] for i in items[:5]])
@@ -757,14 +842,18 @@ async def _search_naver(
                 global_rank += 1
                 if found_rank == 0 and _id_matches(target_id, item["id"]):
                     log.info(
-                        "[Naver] ★ FOUND target_id=%r → rank=%d (page %d, local #%d)",
+                        "[Naver] ★ FOUND target_id=%r → rank=%d (page %d, local #%d) "
+                        "price=%s reviews=%s",
                         target_id, global_rank, page_num, local_idx,
+                        item.get("price"), item.get("reviews"),
                     )
                     found_rank, found_page = global_rank, page_num
+                    my_price = item.get("price")
+                    my_reviews = item.get("reviews")
 
             # 1페이지를 처리한 뒤 이미 발견했고 top5 도 확보했으면 조기 종료
             if found_rank and top5:
-                return found_rank, found_page, top5, STATUS_OK
+                return _result(found_rank, found_page, STATUS_OK)
 
             await page.wait_for_timeout(random.randint(1_000, 2_000))
 
@@ -775,15 +864,15 @@ async def _search_naver(
         await page.close()
 
     if found_rank:
-        return found_rank, found_page, top5, STATUS_OK
+        return _result(found_rank, found_page, STATUS_OK)
     if errored:
         log.info("[Naver] target_id=%r — 스크래퍼 오류로 측정 실패", target_id)
-        return 0, None, top5, STATUS_ERROR
+        return _result(0, None, STATUS_ERROR)
     if blocked:
         log.info("[Naver] target_id=%r — 차단 페이지로 측정 실패", target_id)
-        return 0, None, top5, STATUS_BLOCKED
+        return _result(0, None, STATUS_BLOCKED)
     log.info("[Naver] target_id=%r — %d페이지 내 미발견", target_id, max_pages)
-    return 0, None, top5, STATUS_NOT_FOUND
+    return _result(0, None, STATUS_NOT_FOUND)
 
 
 async def _search_coupang(
@@ -791,19 +880,25 @@ async def _search_coupang(
     keyword: str,
     target_id: str,
     max_pages: int,
-) -> tuple[int, Optional[int], list[dict], str]:
+) -> RankResult:
     """
-    Returns (rank, page_num, top5, status).
-    top5  : [{"rank": int, "name": str, "target_id": str}]
-    status: ok | not_found | blocked | error
+    쿠팡에서 keyword 를 검색해 target_id 의 순위와 Top5 경쟁사 지표를 담은
+    RankResult 를 반환한다. status: ok | not_found | blocked | error.
     """
     page = await context.new_page()
     global_rank = 0
     top5: list[dict] = []
     found_rank: int = 0
     found_page: Optional[int] = None
+    my_price: Optional[int] = None
+    my_reviews: Optional[int] = None
     blocked: bool = False
     errored: bool = False
+
+    def _result(rank: int, pg: Optional[int], status: str) -> RankResult:
+        return RankResult(rank=rank, page=pg, keyword=keyword, platform="coupang",
+                          target_id=target_id, top5=top5, status=status,
+                          my_price=my_price, my_review_count=my_reviews)
 
     await _warm_up(page, "https://www.coupang.com/")
 
@@ -863,15 +958,9 @@ async def _search_coupang(
                 break
 
             if page_num == 1 and not top5:
-                top5 = [
-                    {
-                        "rank": idx + 1,
-                        "name": it.get("name") or "(이름없음)",
-                        "target_id": it.get("id") or "",
-                    }
-                    for idx, it in enumerate(items[:5])
-                ]
-                log.info("[Coupang] Top5 수집: %s", [(t["rank"], t["name"][:20]) for t in top5])
+                top5 = _build_top5(items)
+                log.info("[Coupang] Top5 수집: %s",
+                         [(t["rank"], t["name"][:14], t["price"]) for t in top5])
 
             log.info("[Coupang] page %d: %d개 상품 추출 — 앞 5개: %s",
                      page_num, len(items), [i["id"] for i in items[:5]])
@@ -880,13 +969,17 @@ async def _search_coupang(
                 global_rank += 1
                 if found_rank == 0 and _id_matches(target_id, item["id"]):
                     log.info(
-                        "[Coupang] ★ FOUND target_id=%r → rank=%d (page %d, local #%d)",
+                        "[Coupang] ★ FOUND target_id=%r → rank=%d (page %d, local #%d) "
+                        "price=%s reviews=%s",
                         target_id, global_rank, page_num, local_idx,
+                        item.get("price"), item.get("reviews"),
                     )
                     found_rank, found_page = global_rank, page_num
+                    my_price = item.get("price")
+                    my_reviews = item.get("reviews")
 
             if found_rank and top5:
-                return found_rank, found_page, top5, STATUS_OK
+                return _result(found_rank, found_page, STATUS_OK)
 
             await page.wait_for_timeout(random.randint(1_500, 2_500))
 
@@ -897,15 +990,15 @@ async def _search_coupang(
         await page.close()
 
     if found_rank:
-        return found_rank, found_page, top5, STATUS_OK
+        return _result(found_rank, found_page, STATUS_OK)
     if errored:
         log.info("[Coupang] target_id=%r — 스크래퍼 오류로 측정 실패", target_id)
-        return 0, None, top5, STATUS_ERROR
+        return _result(0, None, STATUS_ERROR)
     if blocked:
         log.info("[Coupang] target_id=%r — 차단 페이지로 측정 실패", target_id)
-        return 0, None, top5, STATUS_BLOCKED
+        return _result(0, None, STATUS_BLOCKED)
     log.info("[Coupang] target_id=%r — %d페이지 내 미발견", target_id, max_pages)
-    return 0, None, top5, STATUS_NOT_FOUND
+    return _result(0, None, STATUS_NOT_FOUND)
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +1024,8 @@ async def get_rank(
     if platform not in ("naver", "coupang"):
         raise ValueError(f"platform must be 'naver' or 'coupang', got: {platform!r}")
 
-    rank, page_num, top5, status = 0, None, [], STATUS_NOT_FOUND
+    result = RankResult(rank=0, page=None, keyword=keyword, platform=platform,
+                        target_id=target_id, status=STATUS_NOT_FOUND)
     async with async_playwright() as pw:
         context = await _launch_persistent_context(pw, headless=headless, slow_mo=slow_mo)
         try:
@@ -942,25 +1036,15 @@ async def get_rank(
                                 platform.upper(), cooldown, attempt, block_retries)
                     await asyncio.sleep(cooldown)
                 if platform == "naver":
-                    rank, page_num, top5, status = await _search_naver(
-                        context, keyword, target_id, max_pages)
+                    result = await _search_naver(context, keyword, target_id, max_pages)
                 else:
-                    rank, page_num, top5, status = await _search_coupang(
-                        context, keyword, target_id, max_pages)
-                if status != STATUS_BLOCKED:
+                    result = await _search_coupang(context, keyword, target_id, max_pages)
+                if result.status != STATUS_BLOCKED:
                     break   # 차단이 아니면(성공·미노출·오류) 재시도 불필요
         finally:
             await context.close()
 
-    return RankResult(
-        rank=rank,
-        page=page_num,
-        keyword=keyword,
-        platform=platform,
-        target_id=target_id,
-        top5=top5,
-        status=status,
-    )
+    return result
 
 
 async def get_all_ranks(
@@ -992,16 +1076,10 @@ async def get_all_ranks(
 
         async def _scrape_one(item: dict) -> RankResult:
             if platform == "naver":
-                rank, pg, top5, status = await _search_naver(
+                return await _search_naver(
                     ctx, item["keyword"], item["target_id"], max_pages)
-            else:
-                rank, pg, top5, status = await _search_coupang(
-                    ctx, item["keyword"], item["target_id"], max_pages)
-            return RankResult(
-                rank=rank, page=pg, keyword=item["keyword"],
-                platform=platform, target_id=item["target_id"],
-                top5=top5, status=status,
-            )
+            return await _search_coupang(
+                ctx, item["keyword"], item["target_id"], max_pages)
 
         results: list[Optional[RankResult]] = [None] * len(items)
         pending = list(range(len(items)))   # 아직 차단 미해소 인덱스
@@ -1066,14 +1144,21 @@ def _dedupe_ordered(seq: list[str]) -> list[str]:
 
 
 def _dedupe_items(seq: list[dict]) -> list[dict]:
-    """id 기준으로 중복 제거, 순서 보존."""
+    """id 기준으로 중복 제거, 순서 보존. 가격·리뷰 등 부가 지표도 함께 보존한다."""
     seen: set[str] = set()
     out: list[dict] = []
     for item in seq:
         pid = (item.get("id") or "").strip()
         if pid and pid not in seen:
             seen.add(pid)
-            out.append({"id": pid, "name": (item.get("name") or "").strip()})
+            out.append({
+                "id":      pid,
+                "name":    (item.get("name") or "").strip(),
+                "price":   item.get("price"),
+                "reviews": item.get("reviews"),
+                "rating":  item.get("rating"),
+                "thumb":   item.get("thumb"),
+            })
     return out
 
 
